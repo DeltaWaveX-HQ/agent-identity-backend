@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -262,26 +263,10 @@ func (d *serverDeps) renderConsentPage(w http.ResponseWriter, status int, rec *a
 		title = "Sub-agent “" + rec.SubAgentName + "” wants delegated access"
 		intro = "A sub-agent works on behalf of one of your agents. It gets a subset of that agent's permissions, for a short time, and is revoked automatically if the parent is."
 		ttlSelect = `<select name="ttl"><option value="5m">5 minutes</option><option value="10m" selected>10 minutes</option><option value="1h">1 hour</option></select>`
-		parents := d.authServer.ActiveParentGrants(d.mcpResource, "")
+		// The parent is chosen after sign-in from the signed-in user's own agents: listing parents
+		// here would show every user's agents to anyone who opens this page.
 		perms.WriteString(`<fieldset><legend>Works under</legend>`)
-		if len(parents) == 0 {
-			perms.WriteString(`<div class="err">No parent agent has active access. Connect and approve a parent agent first (` + html.EscapeString(d.mcpResource) + `).</div>`)
-		} else {
-			perms.WriteString(`<select name="parent_consent_id" required>`)
-			for _, pc := range parents {
-				name := pc.AgentID
-				if pa, ok := d.authServer.GetAgent(pc.AgentID); ok && pa.Name != "" {
-					name = pa.Name
-				}
-				var acts []string
-				for _, ad := range pc.AuthorizationDetails {
-					acts = append(acts, ad.Actions...)
-				}
-				fmt.Fprintf(&perms, `<option value="%s">%s · %s · can %s · %s</option>`, html.EscapeString(pc.ConsentID), html.EscapeString(name),
-					html.EscapeString(strings.TrimPrefix(pc.UserSub, "user:")), html.EscapeString(strings.Join(acts, ", ")), humanDuration(pc.ExpiresAt-time.Now().Unix()))
-			}
-			perms.WriteString(`</select><small class="hint">You can only delegate permissions the parent already has.</small>`)
-		}
+		perms.WriteString(`<div class="hint">Your agent that is connected right now (we pick it after you sign in). The sub-agent can only get permissions that agent already has.</div>`)
 		perms.WriteString(`</fieldset><fieldset><legend>Allow this sub-agent to</legend>`)
 	} else {
 		perms.WriteString(`<fieldset><legend>Allow this agent to</legend>`)
@@ -304,7 +289,7 @@ func (d *serverDeps) renderConsentPage(w http.ResponseWriter, status int, rec *a
 	}
 	noUsers := ""
 	if len(d.dataStore.ListUsers()) == 0 {
-		noUsers = `<div class="err">No accounts exist yet. Create one in the dashboard (http://localhost:3000) first, then retry.</div>`
+		noUsers = `<div class="err">No accounts exist yet. Create one in the console (` + html.EscapeString(consoleURL()) + `) first, then retry.</div>`
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -410,7 +395,15 @@ func (d *serverDeps) handleBrowserDecision(w http.ResponseWriter, r *http.Reques
 		if ttl, ok = subAgentTTLs[r.FormValue("ttl")]; !ok {
 			ttl = 10 * time.Minute
 		}
-		approved, err = d.authServer.ApproveSubAgentConsent(rec.ConsentID, userSub, r.FormValue("parent_consent_id"), actions, ttl)
+		parentID := r.FormValue("parent_consent_id") // optional: API clients may name the parent grant
+		if parentID == "" {
+			parentID = d.pickParentGrant(userSub, rec.AgentID)
+		}
+		if parentID == "" {
+			err = fmt.Errorf("none of your agents has active access right now. Connect and approve the parent agent first (%s), then try again", d.mcpResource)
+		} else {
+			approved, err = d.authServer.ApproveSubAgentConsent(rec.ConsentID, userSub, parentID, actions, ttl)
+		}
 	} else {
 		if ttl, ok = consentTTLs[r.FormValue("ttl")]; !ok {
 			ttl = time.Hour
@@ -444,4 +437,32 @@ func (d *serverDeps) handleBrowserDecision(w http.ResponseWriter, r *http.Reques
 	}
 	u.RawQuery = qv.Encode()
 	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
+// pickParentGrant chooses the signed-in user's active parent grant for a new sub-agent:
+// the same OAuth client (the app spawning the sub-agent) first, then the most recent.
+func (d *serverDeps) pickParentGrant(userSub, clientID string) string {
+	best := (*auth.ConsentRecord)(nil)
+	for _, c := range d.authServer.ActiveParentGrants(d.mcpResource, userSub) {
+		if best == nil {
+			best = c
+			continue
+		}
+		same, bestSame := c.AgentID == clientID, best.AgentID == clientID
+		if (same && !bestSame) || (same == bestSame && c.CreatedAt > best.CreatedAt) {
+			best = c
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	return best.ConsentID
+}
+
+// consoleURL is the tenant console's public address (CONSOLE_URL).
+func consoleURL() string {
+	if v := os.Getenv("CONSOLE_URL"); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "http://localhost:3000"
 }

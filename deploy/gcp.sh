@@ -124,14 +124,14 @@ COMMON=(--region "$REGION" --service-account "$SA" --add-cloudsql-instances "$CO
 say "Deploying agentid-api"
 gc run deploy agentid-api --image "$IMG/backend:$TAG" "${COMMON[@]}" --memory 512Mi --cpu 1 \
   --set-secrets "DATABASE_URL=agentid-database-url:latest,APP_SECRET=agentid-app-secret:latest,GATEWAY_SHARED_SECRET=agentid-gateway-key:latest" \
-  --set-env-vars "^|^ISSUER_URL=$API_URL|MCP_RESOURCE=$GW_URL/mcp|GATEWAY_URL=$GW_URL|CONSOLE_ORIGINS=$UI_URL|ADMIN_EMAILS=$ADMIN_EMAILS" \
+  --set-env-vars "^|^ISSUER_URL=$API_URL|MCP_RESOURCE=$GW_URL/mcp|GATEWAY_URL=$GW_URL|CONSOLE_ORIGINS=$UI_URL|CONSOLE_URL=$UI_URL|ADMIN_EMAILS=$ADMIN_EMAILS" \
   --startup-probe "httpGet.path=/health,httpGet.port=8080,periodSeconds=5,failureThreshold=24,timeoutSeconds=4"
 
 say "Deploying agentid-gateway"
 gc run deploy agentid-gateway --image "$IMG/backend:$TAG" "${COMMON[@]}" --memory 1Gi --cpu 1 \
-  --command /app/mcp-gateway --args "-config,/app/config/mcp-upstreams.cloud.json" \
+  --command /app/mcp-gateway --args=-config,/app/config/mcp-upstreams.cloud.json \
   --set-secrets "DATABASE_URL=agentid-database-url:latest,GATEWAY_SHARED_SECRET=agentid-gateway-key:latest$GH_SECRET" \
-  --set-env-vars "PUBLIC_URL=$GW_URL,AUTH_SERVER_URL=$API_URL" \
+  --set-env-vars "PUBLIC_URL=$GW_URL,AUTH_SERVER_URL=$API_URL,CONSOLE_URL=$UI_URL" \
   --startup-probe "httpGet.path=/gateway/status,httpGet.port=8080,periodSeconds=5,failureThreshold=36,timeoutSeconds=4"
 
 say "Deploying agentid-console"

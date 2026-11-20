@@ -255,7 +255,7 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"consent_record": rec,
 			"issuance_risk":  issuanceRisk,
-			"consent_url":    fmt.Sprintf("http://localhost:3000?consent_id=%s", rec.ConsentID),
+			"consent_url":    fmt.Sprintf("%s?consent_id=%s", consoleURL(), rec.ConsentID),
 		})
 	})
 

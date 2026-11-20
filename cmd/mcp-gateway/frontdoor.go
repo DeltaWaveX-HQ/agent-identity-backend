@@ -16,6 +16,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -274,7 +275,7 @@ func (g *Gateway) handlePRM(w http.ResponseWriter, r *http.Request) {
 		"scopes_supported":         []string{"mcp:tools"},
 		"bearer_methods_supported": []string{"header"},
 		"resource_name":            "Agent Identity Gateway",
-		"resource_documentation":   "http://localhost:3000",
+		"resource_documentation":   consoleURL(),
 	})
 }
 
@@ -708,4 +709,12 @@ func (g *Gateway) callTool(ctx context.Context, tok string, info *tokenInfo, sid
 		log.Printf("taint     %-28s injection markers: %v", p.Name, markers)
 	}
 	return res, nil, 200
+}
+
+// consoleURL is the tenant console's public address (CONSOLE_URL), shown to clients and humans.
+func consoleURL() string {
+	if v := os.Getenv("CONSOLE_URL"); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "http://localhost:3000"
 }
