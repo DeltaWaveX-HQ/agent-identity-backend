@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"html"
 	"log"
 	"net/http"
 	"net/url"
@@ -37,14 +36,45 @@ func main() {
 	dataDir := resolveDataDir()
 	dataStore := store.NewDataStore(dataDir)
 	orchestrator := sdk.NewScenarioOrchestrator(authServer, dag, riskEngine, enfGateway, sseHub, dataDir)
+	behavior := risk.NewBehaviorTracker()
+	riskEngine.RuleEnabled = dataStore.IsRuleEnabled // console toggles really change enforcement
+
+	// Public issuer URL: what clients see in discovery metadata. Override with ISSUER_URL behind a proxy/tunnel.
+	issuer := os.Getenv("ISSUER_URL")
+	if issuer == "" {
+		p := os.Getenv("PORT")
+		if p == "" {
+			p = "8080"
+		}
+		issuer = "http://localhost:" + p
+	}
+	issuer = strings.TrimRight(issuer, "/")
+
+	mcpResource := os.Getenv("MCP_RESOURCE")
+	if mcpResource == "" {
+		mcpResource = "http://localhost:8090/mcp"
+	}
+	deps := &serverDeps{
+		authServer:  authServer,
+		dag:         dag,
+		km:          km,
+		riskEngine:  riskEngine,
+		behavior:    behavior,
+		dataStore:   dataStore,
+		hub:         sseHub,
+		mcpResource: mcpResource,
+		issuerURL:   issuer,
+	}
 
 	mux := http.NewServeMux()
+	registerMCPEnforcement(mux, deps)
+	registerConsoleAPI(mux, deps)
 
 	// =========================================================================
 	// 1. REAL OIDC & OAUTH 2.1 DISCOVERY METADATA & JWKS (RFC 8414 / RFC 7517)
 	// =========================================================================
 	handleOAuthDiscovery := func(w http.ResponseWriter, r *http.Request) {
-		baseURL := "http://localhost:8080"
+		baseURL := issuer
 		writeJSON(w, http.StatusOK, map[string]any{
 			"issuer":                                     baseURL,
 			"authorization_endpoint":                     baseURL + "/oauth/authorize",
@@ -92,6 +122,11 @@ func main() {
 
 	// POST or GET /oauth/authorize — Starts an OAuth 2.1 + PKCE + RFC 9396 RAR flow
 	mux.HandleFunc("/oauth/authorize", func(w http.ResponseWriter, r *http.Request) {
+		// Standard browser redirect from a real OAuth client (Claude Code, MCPJam, ChatGPT, Gemini CLI…)
+		if r.Method == http.MethodGet && r.URL.Query().Get("redirect_uri") != "" {
+			deps.handleBrowserAuthorize(w, r)
+			return
+		}
 		var req struct {
 			ClientID             string                       `json:"client_id"`
 			UserSub              string                       `json:"user_sub"`
@@ -198,77 +233,6 @@ func main() {
 			},
 		})
 
-		// If this is a standard OAuth 2.1 browser authorization redirect (e.g. from MCPJam OAuth Debugger, Claude, Gemini),
-		// render an interactive HTML Consent Screen that redirects back to redirect_uri?code=...&state=...
-		redirectURI := r.URL.Query().Get("redirect_uri")
-		state := r.URL.Query().Get("state")
-		if r.Method == http.MethodGet && redirectURI != "" {
-			rec.RedirectURI = redirectURI
-			rec.State = state
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			fmt.Fprintf(w, `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Agent Identity — RFC 9396 RAR Consent</title>
-<style>
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f8fafc; color: #0f172a; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }
-  .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 16px; max-width: 480px; width: 100%%; padding: 28px; box-shadow: 0 20px 45px rgba(15,23,42,0.08); }
-  .badge { display: inline-block; background: #eff6ff; color: #1d4ed8; font-weight: 700; font-size: 11px; letter-spacing: .04em; padding: 4px 10px; border-radius: 999px; text-transform: uppercase; }
-  h1 { font-size: 20px; margin: 12px 0 6px; }
-  p { font-size: 13px; color: #475569; margin: 0 0 18px; line-height: 1.5; }
-  .box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px; font-size: 12px; margin-bottom: 20px; }
-  .row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid #f1f5f9; }
-  .row:last-child { border-bottom: 0; }
-  .k { color: #64748b; font-weight: 600; }
-  .v { color: #0f172a; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; word-break: break-all; }
-  .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  button { cursor: pointer; border: 0; border-radius: 10px; padding: 12px 16px; font-weight: 700; font-size: 13px; }
-  .approve { background: #059669; color: #fff; }
-  .approve:hover { background: #047857; }
-  .deny { background: #fff1f2; color: #be123c; border: 1px solid #fecdd3; }
-  .deny:hover { background: #ffe4e6; }
-</style>
-</head>
-<body>
-  <div class="card">
-    <span class="badge">🛡️ Agent Identity · OAuth 2.1 + PKCE + RAR</span>
-    <h1>Authorize MCP Agent Access</h1>
-    <p>An external AI agent is requesting a short-lived, cryptographically audited access pass through your Agent Identity Gateway.</p>
-    <div class="box">
-      <div class="row"><span class="k">Client ID</span><span class="v">%s</span></div>
-      <div class="row"><span class="k">Consent ID</span><span class="v">%s</span></div>
-      <div class="row"><span class="k">Requested Scope</span><span class="v">%s</span></div>
-      <div class="row"><span class="k">Resource / Aud</span><span class="v">%s</span></div>
-      <div class="row"><span class="k">PKCE S256</span><span class="v">%s</span></div>
-      <div class="row"><span class="k">Redirect URI</span><span class="v">%s</span></div>
-    </div>
-    <form method="POST" action="/oauth/authorize/decision">
-      <input type="hidden" name="consent_id" value="%s" />
-      <input type="hidden" name="redirect_uri" value="%s" />
-      <input type="hidden" name="state" value="%s" />
-      <div class="btns">
-        <button type="submit" name="decision" value="deny" class="deny">Deny Access</button>
-        <button type="submit" name="decision" value="approve" class="approve">Approve &amp; Issue Pass</button>
-      </div>
-    </form>
-  </div>
-</body>
-</html>`,
-				html.EscapeString(req.ClientID),
-				html.EscapeString(rec.ConsentID),
-				html.EscapeString(req.Scope),
-				html.EscapeString(req.Aud),
-				html.EscapeString(req.CodeChallenge),
-				html.EscapeString(redirectURI),
-				html.EscapeString(rec.ConsentID),
-				html.EscapeString(redirectURI),
-				html.EscapeString(state),
-			)
-			return
-		}
-
 		writeJSON(w, http.StatusOK, map[string]any{
 			"consent_record": rec,
 			"issuance_risk":  issuanceRisk,
@@ -276,56 +240,8 @@ func main() {
 		})
 	})
 
-	// POST /oauth/authorize/decision — Handles the Approve/Deny form from the browser OAuth 2.1 consent screen
-	mux.HandleFunc("/oauth/authorize/decision", func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		consentID := r.FormValue("consent_id")
-		redirectURI := r.FormValue("redirect_uri")
-		state := r.FormValue("state")
-		decision := r.FormValue("decision")
-
-		u, err := url.Parse(redirectURI)
-		if err != nil || redirectURI == "" {
-			http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
-			return
-		}
-		q := u.Query()
-		if state != "" {
-			q.Set("state", state)
-		}
-
-		if decision == "approve" {
-			rec, err := authServer.ApproveConsent(consentID, []string{"read"})
-			if err != nil {
-				q.Set("error", "server_error")
-				q.Set("error_description", err.Error())
-			} else {
-				q.Set("code", rec.AuthCode)
-				sseHub.Publish(events.TelemetryEvent{
-					StepNumber: 2,
-					FromLane:   "user",
-					ToLane:     "as",
-					Label:      "OAuth 2.1 Consent Approved (" + rec.AgentID + ")",
-					Who:        rec.UserSub + " → Auth Server",
-					Headline:   "Human Approved OAuth 2.1 + PKCE Consent in Browser",
-					PlainText:  fmt.Sprintf("Issued single-use PKCE auth code %s for %s", rec.AuthCode, rec.AgentID),
-					FlowNode:   "consent",
-					Status:     "ok",
-					StatusText: "Consent Approved",
-					PhonePrompt: &events.PhonePrompt{
-						Type: "dismiss",
-					},
-				})
-			}
-		} else {
-			_, _, _ = authServer.RevokeConsent(consentID)
-			q.Set("error", "access_denied")
-			q.Set("error_description", "User denied agent authorization request")
-		}
-
-		u.RawQuery = q.Encode()
-		http.Redirect(w, r, u.String(), http.StatusFound)
-	})
+	// POST /oauth/authorize/decision — Sign-in + Approve/Deny form from the browser consent screen
+	mux.HandleFunc("/oauth/authorize/decision", deps.handleBrowserDecision)
 
 	// POST /oauth/token — Real multi-grant OAuth 2.1 Token Endpoint:
 	//   1) grant_type=authorization_code (with PKCE code_verifier + DPoP proof)
@@ -340,7 +256,11 @@ func main() {
 			RefreshToken         string                       `json:"refresh_token"`
 			SubjectToken         string                       `json:"subject_token"`
 			ActorClientID        string                       `json:"actor_client_id"`
+			SubAgent             string                       `json:"sub_agent"`
+			SubAgentType         string                       `json:"sub_agent_type"`
+			RequestedTTL         int64                        `json:"requested_ttl"`
 			ClientID             string                       `json:"client_id"`
+			RedirectURI          string                       `json:"redirect_uri"`
 			UserSub              string                       `json:"user_sub"`
 			Scope                string                       `json:"scope"`
 			Aud                  string                       `json:"aud"`
@@ -355,7 +275,11 @@ func main() {
 			req.RefreshToken = r.FormValue("refresh_token")
 			req.SubjectToken = r.FormValue("subject_token")
 			req.ActorClientID = r.FormValue("actor_client_id")
+			req.SubAgent = r.FormValue("sub_agent")
+			req.SubAgentType = r.FormValue("sub_agent_type")
+			fmt.Sscan(r.FormValue("requested_ttl"), &req.RequestedTTL)
 			req.ClientID = r.FormValue("client_id")
+			req.RedirectURI = r.FormValue("redirect_uri")
 			req.UserSub = r.FormValue("user_sub")
 			req.Scope = r.FormValue("scope")
 			req.Aud = r.FormValue("resource")
@@ -373,10 +297,27 @@ func main() {
 
 		switch req.GrantType {
 		case "authorization_code":
+			codeRec, known := authServer.ConsentForCode(req.Code)
+			if known && req.ClientID != "" && req.ClientID != codeRec.AgentID {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant", "error_description": "code was not issued to this client"})
+				return
+			}
+			if known && codeRec.RedirectURI != "" && req.RedirectURI != "" && req.RedirectURI != codeRec.RedirectURI {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant", "error_description": "redirect_uri does not match the authorization request"})
+				return
+			}
+			if known && (authServer.IsAgentRevoked(codeRec.AgentID) || (codeRec.SubAgentID != "" && authServer.IsAgentRevoked(codeRec.SubAgentID))) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant", "error_description": "agent revoked by administrator"})
+				return
+			}
 			// Generate or extract DPoP thumbprint from the agent's real DPoP proof header
 			kp, _ := crypto.GenerateAgentDPoPKeypair(req.ClientID)
 			dpopHeader := r.Header.Get("DPoP")
 			jkt := kp.Thumbprint
+			if dpopHeader == "" && known && codeRec.RedirectURI != "" {
+				// Real browser-flow client without DPoP support (Claude, ChatGPT, Gemini): plain bearer token.
+				jkt = ""
+			}
 			if dpopHeader != "" {
 				if pubJWK, _, err := crypto.VerifyDPoPProof(dpopHeader, "POST", tokenEndpointURL, "", ""); err == nil && pubJWK != nil {
 					jkt = crypto.ComputeJWKThumbprint(*pubJWK)
@@ -432,7 +373,7 @@ func main() {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"access_token":       jwtStr,
 				"token_type":         tokType,
-				"expires_in":         300,
+				"expires_in":         claims.EXP - time.Now().Unix(),
 				"refresh_token":      refreshJTI,
 				"scope":              claims.Scope,
 				"claims":             claims,
@@ -442,6 +383,11 @@ func main() {
 			})
 
 		case "urn:ietf:params:oauth:grant-type:token-exchange", "token-exchange":
+			if req.SubAgent != "" {
+				// A real agent (any framework) creating a sub-agent: human-approved delegation.
+				deps.exchangeForSubAgent(w, r, req.SubjectToken, req.ClientID, req.SubAgent, req.SubAgentType, req.Scope, req.Aud, req.RequestedTTL)
+				return
+			}
 			priv, _ := km.ActiveSigner()
 			_, parentClaims, err := crypto.VerifyAccessToken(&priv.PublicKey, req.SubjectToken)
 			if err != nil {
@@ -496,6 +442,47 @@ func main() {
 			})
 
 		case "refresh_token":
+			if node, known := dag.GetToken(req.RefreshToken); known && node.TokenType == "refresh_token" {
+				jwtStr, claims, newRT, err := authServer.RefreshAccessToken(req.RefreshToken, req.ClientID)
+				if err != nil {
+					famID := node.FamilyID
+					dataStore.AppendAuditLog(store.AuditLogEntry{
+						ActorUser: node.UserSub, AgentID: node.ClientID, EventType: "REFRESH_REFUSED", Method: "POST /oauth/token",
+						Resource: "refresh_token", RiskScore: 0.9, Verdict: "deny", Reasons: []string{err.Error()}, FamilyID: famID,
+					})
+					status := http.StatusBadRequest
+					if strings.Contains(err.Error(), "replay") {
+						status = http.StatusForbidden
+					}
+					writeJSON(w, status, map[string]any{"error": "invalid_grant", "error_description": err.Error(), "family_graph": dag.GetSnapshot(famID)})
+					return
+				}
+				dataStore.AppendAuditLog(store.AuditLogEntry{
+					ActorUser: claims.Sub, AgentID: claims.ClientID, EventType: "TOKEN_REFRESHED", Method: "POST /oauth/token",
+					Resource: claims.Aud, Verdict: "allow", TokenJTI: claims.JTI, FamilyID: claims.FamilyID,
+				})
+				sseHub.Publish(events.TelemetryEvent{
+					FromLane: "agent", ToLane: "as", FlowNode: "refresh", Label: "Token rotated (" + claims.ClientID + ")",
+					Who: claims.ClientID + " → Auth server", Headline: "Refresh token used once and rotated",
+					PlainText: fmt.Sprintf("New 5-minute token %s issued in family %s; the old refresh token is now dead.", claims.JTI, claims.FamilyID),
+					Status: "ok", StatusText: "Rotated", TokenClaims: claims,
+				})
+				tokType := "Bearer"
+				if claims.CNF != nil && claims.CNF["jkt"] != "" {
+					tokType = "DPoP"
+				}
+				writeJSON(w, http.StatusOK, map[string]any{
+					"access_token":  jwtStr,
+					"token_type":    tokType,
+					"expires_in":    claims.EXP - time.Now().Unix(),
+					"refresh_token": newRT,
+					"scope":         claims.Scope,
+					"status":        "rotated",
+					"family_id":     claims.FamilyID,
+					"family_graph":  dag.GetSnapshot(claims.FamilyID),
+				})
+				return
+			}
 			reused, famID := dag.RotateRefreshToken(req.RefreshToken)
 			if reused {
 				dataStore.AppendAuditLog(store.AuditLogEntry{
@@ -604,7 +591,12 @@ func main() {
 		var body struct {
 			Token string `json:"token"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+			_ = r.ParseForm()
+			body.Token = r.FormValue("token")
+		} else {
+			_ = json.NewDecoder(r.Body).Decode(&body)
+		}
 		if body.Token == "" {
 			body.Token = r.URL.Query().Get("token")
 		}
@@ -637,26 +629,33 @@ func main() {
 			dcrReq.SPIFFEID = "spiffe://acme.in/ns/auto-dcr/sa/" + slug
 		}
 		if dcrReq.OwnerUser == "" {
-			dcrReq.OwnerUser = "user:priya@acme.in"
+			dcrReq.OwnerUser = "pending-consent" // set to the human who approves the first consent
 		}
 		if dcrReq.ModelID == "" {
-			dcrReq.ModelID = "gemini-2.5-flash"
+			dcrReq.ModelID = "unknown (external MCP client)"
 		}
 		if dcrReq.Scope == "" {
-			dcrReq.Scope = "crm.read invoices.read"
+			dcrReq.Scope = "mcp:tools"
+		}
+		for _, ru := range dcrReq.RedirectURIs {
+			if u, err := url.Parse(ru); err != nil || u.Scheme == "" || (u.Scheme == "http" && !isLoopback(u)) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_redirect_uri", "error_description": "redirect URIs must be https or loopback http: " + ru})
+				return
+			}
 		}
 
-		clientID := "agent:dcr-" + strings.ToLower(strings.ReplaceAll(dcrReq.ClientName, " ", "-"))
+		clientID := "agent:dcr-" + clientSlug(dcrReq.ClientName)
 		registered, err := authServer.RegisterAgent(auth.RegisteredAgent{
 			AgentID:           clientID,
-			Name:              dcrReq.ClientName + " (DCR Auto-Registered)",
+			Name:              dcrReq.ClientName,
 			OwnerUser:         dcrReq.OwnerUser,
 			ParentAgentID:     dcrReq.ParentAgentID,
 			SPIFFEID:          dcrReq.SPIFFEID,
 			RuntimeAttested:   true,
-			PlatformFramework: "RFC 7591 Dynamic Client Registration (DCR)",
+			PlatformFramework: "MCP client · registered itself (RFC 7591)",
 			ModelID:           dcrReq.ModelID,
 			AllowedScopes:     strings.Fields(dcrReq.Scope),
+			RedirectURIs:      dcrReq.RedirectURIs,
 		})
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client_metadata", "error_description": err.Error()})
@@ -705,7 +704,7 @@ func main() {
 			"redirect_uris":              dcrReq.RedirectURIs,
 			"response_types":             respTypes,
 			"token_endpoint_auth_method": authMethod,
-			"grant_types":                []string{"authorization_code", "urn:ietf:params:oauth:grant-type:token-exchange", "refresh_token"},
+			"grant_types":                []string{"authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:token-exchange"},
 			"scope":                      dcrReq.Scope,
 			"spiffe_id":                  registered.SPIFFEID,
 			"dpop_cnf_jkt":               registered.DPoPThumbprint,
@@ -882,6 +881,7 @@ func main() {
 
 	mux.HandleFunc("/api/v1/workspace/reset", func(w http.ResponseWriter, r *http.Request) {
 		authServer.Reset()
+		behavior.Reset()
 		sseHub.ClearHistory()
 		dataStore.ClearOrgActivity("")
 		writeJSON(w, http.StatusOK, map[string]string{"status": "workspace_cleared"})
@@ -984,6 +984,20 @@ func main() {
 		})
 	})
 
+	mux.HandleFunc("/api/v1/agents/restore", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			AgentID string `json:"agent_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		agent, err := authServer.RestoreAgent(body.AgentID)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			return
+		}
+		dataStore.AppendAuditLog(store.AuditLogEntry{ActorUser: "admin", AgentID: agent.AgentID, EventType: "AGENT_RESTORED", Method: "POST /api/v1/agents/restore", Verdict: "allow"})
+		writeJSON(w, http.StatusOK, agent)
+	})
+
 	// Consents Management (End-User My Consents & Revocation Portal)
 	mux.HandleFunc("/api/v1/consents", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, authServer.ListConsents())
@@ -994,6 +1008,16 @@ func main() {
 			ConsentID string `json:"consent_id"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		if strings.HasPrefix(body.ConsentID, "deleg_") {
+			dl, ok := authServer.RevokeDelegation(body.ConsentID)
+			if !ok {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "delegation not found"})
+				return
+			}
+			dataStore.AppendAuditLog(store.AuditLogEntry{ActorUser: dl.UserSub, AgentID: dl.SubAgentID, ParentAgent: dl.ParentAgentID, EventType: "USER_WITHDREW_CONSENT", Method: "POST /api/v1/consents/revoke", Resource: dl.ID, Verdict: "block_and_revoke"})
+			writeJSON(w, http.StatusOK, map[string]any{"delegation": dl})
+			return
+		}
 		rec, snap, err := authServer.RevokeConsent(body.ConsentID)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
@@ -1038,12 +1062,40 @@ func main() {
 
 	mux.HandleFunc("/api/v1/oauth/ciba-resolve", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			AuthReqID string `json:"auth_req_id"`
-			Approved  bool   `json:"approved"`
+			AuthReqID      string `json:"auth_req_id"`
+			Approved       bool   `json:"approved"`
+			ElevateSeconds int64  `json:"elevate_seconds"` // 0 = approve once; >0 = allow this action for that long
+			// For "new sub-agent" requests: what to delegate and for how long.
+			Actions    []string `json:"actions"`
+			TTLSeconds int64    `json:"ttl_seconds"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
+		}
+		if pending, ok := authServer.GetCIBARequest(body.AuthReqID); ok && pending.Kind == "sub_agent" {
+			req, err := authServer.ResolveSubAgentRequest(body.AuthReqID, body.Approved, body.Actions, body.TTLSeconds)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, req)
+			return
+		}
+		if body.Approved && body.ElevateSeconds > 0 {
+			if pending, ok := authServer.GetCIBARequest(body.AuthReqID); ok && pending.Status == "PENDING" && pending.CanElevate {
+				secs := body.ElevateSeconds
+				if secs > pending.MaxElevateSeconds {
+					secs = pending.MaxElevateSeconds
+				}
+				until := authServer.Elevate(pending.FamilyID, pending.Action, time.Now().Unix()+secs)
+				authServer.AnnotateCIBA(body.AuthReqID, func(r *auth.CIBARequest) { r.ElevatedUntil = until })
+				dataStore.AppendAuditLog(store.AuditLogEntry{
+					ActorUser: pending.UserSub, AgentID: pending.AgentID, ParentAgent: pending.ParentAgentID, EventType: "TEMPORARY_ACCESS_GRANTED",
+					Method: "POST /api/v1/oauth/ciba-resolve", Resource: pending.Action, Verdict: "allow", FamilyID: pending.FamilyID,
+					Reasons: []string{fmt.Sprintf("%s allowed until %s", pending.Action, time.Unix(until, 0).UTC().Format(time.RFC3339))},
+				})
+			}
 		}
 		req, err := authServer.ResolveCIBARequest(body.AuthReqID, body.Approved)
 		if err != nil {
@@ -1103,7 +1155,7 @@ func main() {
 			}
 			// Also add host to Risk Engine allowlist if newly registered
 			if rt.UpstreamHost != "" {
-				riskEngine.AllowedHosts[strings.ToLower(rt.UpstreamHost)] = true
+				riskEngine.AllowHost(rt.UpstreamHost)
 			}
 			created := dataStore.AddGatewayRoute(rt)
 			writeJSON(w, http.StatusCreated, created)

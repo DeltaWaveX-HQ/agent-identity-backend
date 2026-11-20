@@ -1,0 +1,2 @@
+invoice_id,vendor,gstin,issue_date,due_date,amount_inr,status
+INV-2026-Q3-0152,Tata Steel Ltd,20AAACT2803M1ZL,2026-08-12,2026-09-11,1200000,paid

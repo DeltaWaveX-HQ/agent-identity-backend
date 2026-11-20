@@ -466,8 +466,8 @@ func (ds *DataStore) AppendAuditLog(entry AuditLogEntry) AuditLogEntry {
 		entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	}
 	ds.state.AuditLogs = append([]*AuditLogEntry{&entry}, ds.state.AuditLogs...)
-	if len(ds.state.AuditLogs) > 300 {
-		ds.state.AuditLogs = ds.state.AuditLogs[:300]
+	if len(ds.state.AuditLogs) > 2000 {
+		ds.state.AuditLogs = ds.state.AuditLogs[:2000]
 	}
 	_ = ds.save()
 	return entry

@@ -1,0 +1,2 @@
+invoice_id,vendor,gstin,issue_date,due_date,amount_inr,status
+INV-2026-Q3-0167,Mumbai Office Facilities LLP,27AAJFM5521K1Z2,2026-09-20,2026-10-20,45000,unpaid

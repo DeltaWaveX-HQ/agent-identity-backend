@@ -4,5 +4,10 @@ node_modules/
 out/
 *.log
 .env*.local
-agent-identity-server
-mcp-gateway
+/agent-identity-server
+/mcp-gateway
+/demo-bank-mcp
+demo-data/bank_state.json
+
+# runtime state (users, sessions, audit) - never commit
+data/idp_tenant_state.json

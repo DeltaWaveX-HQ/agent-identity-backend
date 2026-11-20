@@ -1,0 +1,2 @@
+invoice_id,vendor,gstin,issue_date,due_date,amount_inr,status
+INV-2026-Q3-0141,CloudInfra India Pvt Ltd,27AAACC1234F1Z5,2026-07-04,2026-08-03,182000,paid

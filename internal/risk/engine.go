@@ -3,6 +3,7 @@ package risk
 import (
 	"math"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -46,6 +47,9 @@ type ScoreRequest struct {
 	UnissuedCredential   bool     `json:"unissued_credential"`
 	MonitoringTampering  bool     `json:"monitoring_tampering"`
 	UnsignedInboundBurst bool     `json:"unsigned_inbound_burst"`
+	// Signals derived by the gateway itself (never self-reported by the agent):
+	NewDestination bool `json:"new_destination,omitempty"` // first time this token family touches this host
+	BulkRead       bool `json:"bulk_read,omitempty"`       // export / dump / very large page size
 	// Telemetry for differentiating Human vs. Agent on the wire:
 	HasAgentToken   bool `json:"has_agent_token"`
 	HasDPoPProof    bool `json:"has_dpop_proof"`
@@ -69,19 +73,56 @@ type RiskDecision struct {
 
 type Engine struct {
 	PolicyVersion string
-	AllowedHosts  map[string]bool
+	// RuleEnabled lets the tenant switch individual hard rules off from the console.
+	// nil means every rule is on.
+	RuleEnabled func(code string) bool
+	hostsMu       sync.RWMutex
+	allowedHosts  map[string]bool
 }
 
 func NewEngine() *Engine {
 	return &Engine{
 		PolicyVersion: "cedar-acme-in-v14",
-		AllowedHosts: map[string]bool{
+		allowedHosts: map[string]bool{
 			"gw.acme.local":       true,
 			"invoices.acme.local": true,
 			"payments.acme.local": true,
 			"crm.acme.local":      true,
 		},
 	}
+}
+
+func (e *Engine) ruleOn(code string) bool {
+	return e.RuleEnabled == nil || e.RuleEnabled(code)
+}
+
+// AllowHost adds a destination to the tenant egress allowlist (safe for concurrent use).
+func (e *Engine) AllowHost(host string) {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return
+	}
+	e.hostsMu.Lock()
+	e.allowedHosts[host] = true
+	e.hostsMu.Unlock()
+}
+
+// IsHostAllowed reports whether a destination is on the egress allowlist.
+func (e *Engine) IsHostAllowed(host string) bool {
+	e.hostsMu.RLock()
+	defer e.hostsMu.RUnlock()
+	return e.allowedHosts[strings.ToLower(host)]
+}
+
+// AllowedHostList returns a snapshot of the egress allowlist.
+func (e *Engine) AllowedHostList() []string {
+	e.hostsMu.RLock()
+	defer e.hostsMu.RUnlock()
+	out := make([]string, 0, len(e.allowedHosts))
+	for h := range e.allowedHosts {
+		out = append(out, h)
+	}
+	return out
 }
 
 // ClassifyActor determines whether a request is from a real Human Principal, an Attested AI Agent, or a Shadow Agent using human credentials.
@@ -107,7 +148,11 @@ func (e *Engine) ClassifyActor(req ScoreRequest) ActorClassification {
 		} else {
 			signals = append(signals, "OAuth 2.1 'at+jwt' carries distinct agent client_id ("+req.AgentID+") separate from user sub")
 		}
-		signals = append(signals, "SPIFFE workload certificate & RFC 9449 DPoP sender-constrained signature verified")
+		if req.HasDPoPProof || req.RuntimeAttested {
+			signals = append(signals, "SPIFFE workload certificate & RFC 9449 DPoP sender-constrained signature verified")
+		} else {
+			signals = append(signals, "Bearer access token from our authorization server (client cannot do DPoP; not sender-constrained)")
+		}
 		if isMachineSpeed {
 			signals = append(signals, "Machine-speed cadence matches declared AI agent workload")
 		}
@@ -115,7 +160,7 @@ func (e *Engine) ClassifyActor(req ScoreRequest) ActorClassification {
 			DetectedActorType: actorType,
 			Confidence:        0.99,
 			HasAgentToken:     true,
-			HasDPoPProof:      true,
+			HasDPoPProof:      req.HasDPoPProof || req.RuntimeAttested,
 			InterActionMs:     interMs,
 			LLMPauseBurst:     req.LLMPauseBurst,
 			HeadlessRuntime:   true,
@@ -188,22 +233,22 @@ func (e *Engine) Decide(req ScoreRequest) RiskDecision {
 		weights["shadow_agent_on_human_credential"] = 0.68
 		reasons = append(reasons, "shadow_agent_on_human_credential (stops us-banks-third-party-agents incident)")
 	}
-	if req.TargetHost != "" && !e.AllowedHosts[strings.ToLower(req.TargetHost)] {
+	if req.TargetHost != "" && !e.IsHostAllowed(req.TargetHost) && e.ruleOn("RULE_DEFAULT_DENY_UNKNOWN_EGRESS") {
 		hardRule = "RULE_DEFAULT_DENY_UNKNOWN_EGRESS: outbound destination '" + req.TargetHost + "' is outside tenant allowlist"
 		weights["egress_unknown_host"] = 0.45
 		reasons = append(reasons, "egress_unknown_host ("+req.TargetHost+")")
 	}
-	if req.MonitoringTampering || strings.Contains(strings.ToLower(req.TargetResource), "/monitoring") || strings.Contains(strings.ToLower(req.TargetResource), "/alerts") {
+	if (req.MonitoringTampering || strings.Contains(strings.ToLower(req.TargetResource), "/monitoring") || strings.Contains(strings.ToLower(req.TargetResource), "/alerts")) && e.ruleOn("RULE_PROTECT_OVERSIGHT_CONFIG") {
 		hardRule = "RULE_PROTECT_OVERSIGHT_CONFIG: agent attempted to modify safety monitoring / alerting configuration"
 		weights["oversight_config_tampering"] = 0.65
 		reasons = append(reasons, "oversight_config_tampering")
 	}
-	if req.Action == "delete" || req.Action == "drop_table" {
+	if (req.Action == "delete" || req.Action == "drop_table") && e.ruleOn("RULE_NEVER_DELETE_DESTRUCTIVE") {
 		hardRule = "RULE_NEVER_DELETE_DESTRUCTIVE: tenant policy forbids autonomous destructive deletes"
 		weights["destructive_action_blocked"] = 0.60
 		reasons = append(reasons, "destructive_action_blocked")
 	}
-	if req.UnissuedCredential {
+	if req.UnissuedCredential && e.ruleOn("RULE_UNISSUED_CREDENTIAL_BLOCK") {
 		hardRule = "RULE_UNISSUED_CREDENTIAL_BLOCK: agent attempted to use static/stolen credential not issued to this run"
 		weights["unissued_credential_origin"] = 0.55
 		reasons = append(reasons, "unissued_credential_origin")
@@ -214,6 +259,11 @@ func (e *Engine) Decide(req ScoreRequest) RiskDecision {
 
 	if req.RuntimeAttested {
 		weights["spiffe_runtime_attested"] = -0.04
+	} else if req.HasAgentToken {
+		// Off-the-shelf MCP clients (Claude, ChatGPT, Gemini) present a valid agent token from our
+		// authorization server but cannot attest their runtime or bind the token with DPoP.
+		// Recorded for audit; not penalised, otherwise every call would need a human.
+		weights["bearer_token_not_sender_constrained"] = 0
 	} else if actorClass.DetectedActorType != "HUMAN_PRINCIPAL" {
 		score += 0.42
 		weights["unattested_workload_runtime"] = 0.42
@@ -265,10 +315,22 @@ func (e *Engine) Decide(req ScoreRequest) RiskDecision {
 		reasons = append(reasons, "high_velocity_machine_burst")
 	}
 
-	if req.AmountINR > 0 || req.Action == "payment_transfer" || req.Action == "privilege_escalation" {
+	if (req.AmountINR > 0 || req.Action == "payment_transfer" || req.Action == "privilege_escalation") && e.ruleOn("RULE_CIBA_FINANCIAL_STEP_UP") {
 		score += 0.44
 		weights["high_sensitivity_financial_mutation"] = 0.44
 		reasons = append(reasons, "high_sensitivity_financial_mutation (requires human step-up)")
+	}
+
+	if req.NewDestination {
+		score += 0.12
+		weights["new_destination_for_this_run"] = 0.12
+		reasons = append(reasons, "new_destination_for_this_run ("+req.TargetHost+")")
+	}
+
+	if req.BulkRead {
+		score += 0.20
+		weights["bulk_read_or_export"] = 0.20
+		reasons = append(reasons, "bulk_read_or_export")
 	}
 
 	if req.UnsignedInboundBurst {
@@ -290,10 +352,10 @@ func (e *Engine) Decide(req ScoreRequest) RiskDecision {
 	score = math.Max(0.04, math.Min(0.99, math.Round(score*100)/100))
 
 	if len(reasons) == 0 {
-		reasons = []string{
-			"spiffe_workload_attested",
-			"action_within_rar_consent",
-			"known_allowlisted_destination",
+		if req.RuntimeAttested {
+			reasons = []string{"spiffe_workload_attested", "action_within_rar_consent", "known_allowlisted_destination"}
+		} else {
+			reasons = []string{"action_within_consent", "no_risk_signals"}
 		}
 	}
 
