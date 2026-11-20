@@ -115,3 +115,15 @@ The script is safe to re-run. It creates or updates:
   - `agentid-console` (the Next.js console from `../agent-identity-ui`).
 
 Images are built with Cloud Build, so no local Docker is needed. At the end it prints the console URL and the `claude mcp add` command for the hosted gateway.
+
+### Continuous deployment
+
+After the first `deploy/gcp.sh`, run `PROJECT_ID=<your-project> ./deploy/setup-cd.sh` once. It connects GitHub through a one-time browser approval and creates two Cloud Build triggers. From then on, every push to `main` or `deploy-gcp` redeploys automatically:
+
+| Repo | What a push does | Time |
+|---|---|---|
+| `agent-identity-backend` | Builds the image, rolls out `agentid-api` and `agentid-gateway`, then runs a smoke test (database, gateway, OAuth challenge) | ~6 min |
+| `agent-identity-ui` | Builds the console and rolls out `agentid-console` | ~4 min |
+
+Builds run as `agentid-deployer`, which can only deploy, push images and write logs. A push changes only the container image: secrets, URLs, Cloud SQL and scaling stay as `deploy/gcp.sh` set them.
+
