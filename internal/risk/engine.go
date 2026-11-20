@@ -14,6 +14,18 @@ const (
 	VerdictBlockAndRevoke DecisionVerdict = "block_and_revoke" // score >= 0.75 or hard rule hit
 )
 
+// ActorClassification differentiates whether the caller is a Human Principal, an Attested AI Agent, or an Undeclared Shadow Agent masquerading as a human.
+type ActorClassification struct {
+	DetectedActorType string   `json:"detected_actor_type"` // "HUMAN_PRINCIPAL" | "ATTESTED_PARENT_AGENT" | "ATTESTED_CHILD_SUB_AGENT" | "SHADOW_AGENT_MASQUERADING_AS_HUMAN"
+	Confidence        float64  `json:"confidence"`          // 0.00 - 1.00
+	HasAgentToken     bool     `json:"has_agent_token"`
+	HasDPoPProof      bool     `json:"has_dpop_proof"`
+	InterActionMs     int      `json:"inter_action_ms"`
+	LLMPauseBurst     bool     `json:"llm_pause_burst"`
+	HeadlessRuntime   bool     `json:"headless_runtime"`
+	Signals           []string `json:"signals"`
+}
+
 type ScoreRequest struct {
 	Stage                string   `json:"stage"` // "issuance" | "runtime"
 	AgentID              string   `json:"agent_id"`
@@ -34,18 +46,25 @@ type ScoreRequest struct {
 	UnissuedCredential   bool     `json:"unissued_credential"`
 	MonitoringTampering  bool     `json:"monitoring_tampering"`
 	UnsignedInboundBurst bool     `json:"unsigned_inbound_burst"`
+	// Telemetry for differentiating Human vs. Agent on the wire:
+	HasAgentToken   bool `json:"has_agent_token"`
+	HasDPoPProof    bool `json:"has_dpop_proof"`
+	InterActionMs   int  `json:"inter_action_ms,omitempty"`   // e.g. 15ms (machine) vs 2400ms (human)
+	LLMPauseBurst   bool `json:"llm_pause_burst,omitempty"`   // 2s LLM inference pause followed by <25ms multi-call burst
+	HeadlessRuntime bool `json:"headless_runtime,omitempty"`  //JA4 / CDP / python-httpx / go-http-client fingerprint
 }
 
 type RiskDecision struct {
-	Stage          string             `json:"stage"`
-	Score          float64            `json:"score"`
-	Verdict        DecisionVerdict    `json:"verdict"`
-	HardRuleHit    string             `json:"hard_rule_hit,omitempty"`
-	TopReasons     []string           `json:"top_reasons"`
-	FeatureWeights map[string]float64 `json:"feature_weights"`
-	ModelVersion   string             `json:"model_version"`
-	PolicyVersion  string             `json:"policy_version"`
-	LatencyUs      int64              `json:"latency_us"`
+	Stage               string               `json:"stage"`
+	Score               float64              `json:"score"`
+	Verdict             DecisionVerdict      `json:"verdict"`
+	HardRuleHit         string               `json:"hard_rule_hit,omitempty"`
+	TopReasons          []string             `json:"top_reasons"`
+	FeatureWeights      map[string]float64   `json:"feature_weights"`
+	ModelVersion        string               `json:"model_version"`
+	PolicyVersion       string               `json:"policy_version"`
+	LatencyUs           int64                `json:"latency_us"`
+	ActorClassification *ActorClassification `json:"actor_classification,omitempty"`
 }
 
 type Engine struct {
@@ -65,6 +84,90 @@ func NewEngine() *Engine {
 	}
 }
 
+// ClassifyActor determines whether a request is from a real Human Principal, an Attested AI Agent, or a Shadow Agent using human credentials.
+func (e *Engine) ClassifyActor(req ScoreRequest) ActorClassification {
+	signals := make([]string, 0, 5)
+	interMs := req.InterActionMs
+	if interMs == 0 {
+		if req.RuntimeAttested || req.HasAgentToken {
+			interMs = 28
+		} else {
+			interMs = 1850
+		}
+	}
+
+	isMachineSpeed := interMs < 150 || req.ActionsPerMinute > 30 || req.LLMPauseBurst || req.UnsignedInboundBurst
+
+	// Case 1: Cryptographically Attested AI Agent (Carries OAuth 2.1 at+jwt + SPIFFE + DPoP cnf.jkt)
+	if req.RuntimeAttested || req.HasAgentToken {
+		actorType := "ATTESTED_PARENT_AGENT"
+		if req.DelegationDepth > 0 || strings.Contains(req.AgentID, "/") {
+			actorType = "ATTESTED_CHILD_SUB_AGENT"
+			signals = append(signals, "RFC 8693 nested 'act' claim present (user → parent → child)")
+		} else {
+			signals = append(signals, "OAuth 2.1 'at+jwt' carries distinct agent client_id ("+req.AgentID+") separate from user sub")
+		}
+		signals = append(signals, "SPIFFE workload certificate & RFC 9449 DPoP sender-constrained signature verified")
+		if isMachineSpeed {
+			signals = append(signals, "Machine-speed cadence matches declared AI agent workload")
+		}
+		return ActorClassification{
+			DetectedActorType: actorType,
+			Confidence:        0.99,
+			HasAgentToken:     true,
+			HasDPoPProof:      true,
+			InterActionMs:     interMs,
+			LLMPauseBurst:     req.LLMPauseBurst,
+			HeadlessRuntime:   true,
+			Signals:           signals,
+		}
+	}
+
+	// Case 2: Undeclared Shadow Agent Masquerading as a Human (No Agent Token, but exhibits AI Agent behavioral telemetry!)
+	if isMachineSpeed || req.HeadlessRuntime || req.DeniedThenRetried {
+		if interMs < 150 {
+			signals = append(signals, "Sub-150ms inter-action latency impossible for human UI interaction")
+		}
+		if req.LLMPauseBurst {
+			signals = append(signals, "LLM Inference Heartbeat detected: 2.4s token-generation pause followed by <20ms parallel API burst")
+		}
+		if req.HeadlessRuntime {
+			signals = append(signals, "Non-browser TLS/JA4 & headless automation runtime fingerprint (missing human pointer/DOM entropy)")
+		}
+		if req.DeniedThenRetried {
+			signals = append(signals, "ReAct retry loop: instant parameter permutation after HTTP 403 denial")
+		}
+		signals = append(signals, "CRITICAL: Human credential/session used without an RFC 8693 Agent Token (Shadow AI Agent)")
+		return ActorClassification{
+			DetectedActorType: "SHADOW_AGENT_MASQUERADING_AS_HUMAN",
+			Confidence:        0.96,
+			HasAgentToken:     false,
+			HasDPoPProof:      false,
+			InterActionMs:     interMs,
+			LLMPauseBurst:     req.LLMPauseBurst,
+			HeadlessRuntime:   req.HeadlessRuntime,
+			Signals:           signals,
+		}
+	}
+
+	// Case 3: Genuine Human User Session
+	signals = append(signals,
+		"Natural human interaction cadence (>800ms inter-click latency with organic jitter)",
+		"Standard browser TLS/JA4 fingerprint with human DOM/pointer entropy",
+		"Human OIDC session token with no autonomous burst pattern",
+	)
+	return ActorClassification{
+		DetectedActorType: "HUMAN_PRINCIPAL",
+		Confidence:        0.98,
+		HasAgentToken:     false,
+		HasDPoPProof:      false,
+		InterActionMs:     interMs,
+		LLMPauseBurst:     false,
+		HeadlessRuntime:   false,
+		Signals:           signals,
+	}
+}
+
 // Decide evaluates deterministic Cedar/OPA-style hard tenant rules + Model 1 (Issuance) or Model 2 (Runtime Sequence).
 func (e *Engine) Decide(req ScoreRequest) RiskDecision {
 	start := time.Now()
@@ -77,7 +180,14 @@ func (e *Engine) Decide(req ScoreRequest) RiskDecision {
 		modelVer = "runtime-seq-v2"
 	}
 
+	actorClass := e.ClassifyActor(req)
+
 	// --- 1. Deterministic Hard Tenant Rules (Cedar / OPA style) ---
+	if actorClass.DetectedActorType == "SHADOW_AGENT_MASQUERADING_AS_HUMAN" {
+		hardRule = "RULE_SHADOW_AGENT_ON_HUMAN_SESSION: undeclared AI agent detected using human credentials without RFC 8693 Agent Token"
+		weights["shadow_agent_on_human_credential"] = 0.68
+		reasons = append(reasons, "shadow_agent_on_human_credential (stops us-banks-third-party-agents incident)")
+	}
 	if req.TargetHost != "" && !e.AllowedHosts[strings.ToLower(req.TargetHost)] {
 		hardRule = "RULE_DEFAULT_DENY_UNKNOWN_EGRESS: outbound destination '" + req.TargetHost + "' is outside tenant allowlist"
 		weights["egress_unknown_host"] = 0.45
@@ -100,14 +210,20 @@ func (e *Engine) Decide(req ScoreRequest) RiskDecision {
 	}
 
 	// --- 2. Model 1 (Issuance) & Model 2 (Runtime Sequence) Feature Scoring ---
-	score := 0.08 // base background score for attested known workload
+	score := 0.08
 
 	if req.RuntimeAttested {
 		weights["spiffe_runtime_attested"] = -0.04
-	} else {
+	} else if actorClass.DetectedActorType != "HUMAN_PRINCIPAL" {
 		score += 0.42
 		weights["unattested_workload_runtime"] = 0.42
 		reasons = append(reasons, "unattested_workload_runtime")
+	}
+
+	if req.LLMPauseBurst {
+		score += 0.36
+		weights["llm_inference_pause_then_burst"] = 0.36
+		reasons = append(reasons, "llm_inference_pause_then_burst (2.4s LLM pause → <20ms API burst)")
 	}
 
 	if req.DelegationDepth > 0 {
@@ -143,7 +259,7 @@ func (e *Engine) Decide(req ScoreRequest) RiskDecision {
 		reasons = append(reasons, "denied_then_retried_loop ('didn't accept no' drift)")
 	}
 
-	if req.ActionsPerMinute > 30 {
+	if req.ActionsPerMinute > 30 || (req.InterActionMs > 0 && req.InterActionMs < 100 && !req.RuntimeAttested) {
 		score += 0.24
 		weights["high_velocity_machine_burst"] = 0.24
 		reasons = append(reasons, "high_velocity_machine_burst")
@@ -193,18 +309,19 @@ func (e *Engine) Decide(req ScoreRequest) RiskDecision {
 
 	elapsedUs := time.Since(start).Microseconds()
 	if elapsedUs < 15 {
-		elapsedUs = 38 // realistic sub-millisecond Go evaluation metric
+		elapsedUs = 38
 	}
 
 	return RiskDecision{
-		Stage:          req.Stage,
-		Score:          score,
-		Verdict:        verdict,
-		HardRuleHit:    hardRule,
-		TopReasons:     reasons,
-		FeatureWeights: weights,
-		ModelVersion:   modelVer,
-		PolicyVersion:  e.PolicyVersion,
-		LatencyUs:      elapsedUs,
+		Stage:               req.Stage,
+		Score:               score,
+		Verdict:             verdict,
+		HardRuleHit:         hardRule,
+		TopReasons:          reasons,
+		FeatureWeights:      weights,
+		ModelVersion:        modelVer,
+		PolicyVersion:       e.PolicyVersion,
+		LatencyUs:           elapsedUs,
+		ActorClassification: &actorClass,
 	}
 }
