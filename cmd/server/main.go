@@ -223,14 +223,21 @@ func main() {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 
+		tokenEndpointURL := "http://localhost:8080/oauth/token"
+		if r.Host != "" {
+			tokenEndpointURL = "http://" + r.Host + "/oauth/token"
+		}
+
 		switch req.GrantType {
 		case "authorization_code":
-			// Generate or extract DPoP thumbprint
+			// Generate or extract DPoP thumbprint from the agent's real DPoP proof header
 			kp, _ := crypto.GenerateAgentDPoPKeypair(req.ClientID)
 			dpopHeader := r.Header.Get("DPoP")
 			jkt := kp.Thumbprint
 			if dpopHeader != "" {
-				if pubJWK, _, err := crypto.VerifyDPoPProof(dpopHeader, "POST", "http://localhost:8080/oauth/token", "", ""); err == nil && pubJWK != nil {
+				if pubJWK, _, err := crypto.VerifyDPoPProof(dpopHeader, "POST", tokenEndpointURL, "", ""); err == nil && pubJWK != nil {
+					jkt = crypto.ComputeJWKThumbprint(*pubJWK)
+				} else if pubJWK, _, err := crypto.VerifyDPoPProof(dpopHeader, "POST", "http://localhost:8080/oauth/token", "", ""); err == nil && pubJWK != nil {
 					jkt = crypto.ComputeJWKThumbprint(*pubJWK)
 				}
 			}
@@ -299,7 +306,15 @@ func main() {
 				subAgentID = parentClaims.ClientID + "/summariser"
 			}
 			subKP, _ := crypto.GenerateAgentDPoPKeypair(subAgentID)
-			subJWT, subClaims, err := authServer.ExchangeSubAgentToken(parentClaims, subAgentID, subKP.Thumbprint, req.Scope)
+			subJKT := subKP.Thumbprint
+			if dpopHeader := r.Header.Get("DPoP"); dpopHeader != "" {
+				if pubJWK, _, err := crypto.VerifyDPoPProof(dpopHeader, "POST", tokenEndpointURL, "", ""); err == nil && pubJWK != nil {
+					subJKT = crypto.ComputeJWKThumbprint(*pubJWK)
+				} else if pubJWK, _, err := crypto.VerifyDPoPProof(dpopHeader, "POST", "http://localhost:8080/oauth/token", "", ""); err == nil && pubJWK != nil {
+					subJKT = crypto.ComputeJWKThumbprint(*pubJWK)
+				}
+			}
+			subJWT, subClaims, err := authServer.ExchangeSubAgentToken(parentClaims, subAgentID, subJKT, req.Scope)
 			if err != nil {
 				writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied", "error_description": err.Error()})
 				return
@@ -315,7 +330,7 @@ func main() {
 				Resource:    subClaims.Aud,
 				RiskScore:   0.12,
 				Verdict:     "allow",
-				DPoPJKT:     subKP.Thumbprint,
+				DPoPJKT:     subJKT,
 				TokenJTI:    subClaims.JTI,
 				FamilyID:    subClaims.FamilyID,
 				LatencyUs:   185,
