@@ -54,8 +54,9 @@ type mcpGatewaySession struct {
 func main() {
 	serverURL := flag.String("server", "http://localhost:8080", "Agent Identity Go Authorization Server & Gateway URL")
 	userEmail := flag.String("user", "ajay@deltawavex.in", "Your logged-in dashboard user email")
-	agentName := flag.String("agent", "Real Claude / Gemini MCP Agent", "Agent display name in your dashboard")
+	agentName := flag.String("agent", "MCPJam / Claude Agent", "Agent display name in your dashboard")
 	modelID := flag.String("model", "claude-4-sonnet / gemini-2.5-pro", "LLM driving this MCP session")
+	httpPort := flag.String("http", "", "Optional HTTP port for Streamable HTTP / SSE MCP transport (e.g. 8090 for MCPJam)")
 	flag.Parse()
 
 	kp, err := crypto.GenerateAgentDPoPKeypair(*agentName)
@@ -70,6 +71,11 @@ func main() {
 		agentName: *agentName,
 		modelID:   *modelID,
 		keypair:   kp,
+	}
+
+	if *httpPort != "" {
+		sess.serveHTTP(*httpPort)
+		return
 	}
 
 	// Read JSON-RPC 2.0 messages from stdin (sent by real Claude Code / Claude Desktop / Gemini CLI)
@@ -422,6 +428,188 @@ func (s *mcpGatewaySession) writeResponse(id any, result any) {
 	}
 	b, _ := json.Marshal(resp)
 	fmt.Println(string(b))
+}
+
+func (s *mcpGatewaySession) buildRPCResponse(req rpcRequest) *rpcResponse {
+	switch req.Method {
+	case "initialize":
+		go s.ensureDCRRegistered()
+		return &rpcResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Result: map[string]any{
+				"protocolVersion": "2024-11-05",
+				"capabilities": map[string]any{
+					"tools": map[string]any{},
+				},
+				"serverInfo": map[string]any{
+					"name":    "agent-identity-enforcement-gateway",
+					"version": "1.0.0",
+				},
+			},
+		}
+	case "notifications/initialized":
+		return nil
+	case "tools/list":
+		return &rpcResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Result: map[string]any{
+				"tools": s.toolDefinitions(),
+			},
+		}
+	case "tools/call":
+		var params toolCallParams
+		_ = json.Unmarshal(req.Params, &params)
+		text, isErr := s.executeGuardedTool(params)
+		return &rpcResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Result: map[string]any{
+				"content": []map[string]any{
+					{
+						"type": "text",
+						"text": text,
+					},
+				},
+				"isError": isErr,
+			},
+		}
+	default:
+		if req.ID == nil {
+			return nil
+		}
+		return &rpcResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Result:  map[string]any{},
+		}
+	}
+}
+
+func (s *mcpGatewaySession) toolDefinitions() []map[string]any {
+	return []map[string]any{
+		{
+			"name":        "read_q3_invoices",
+			"description": "Reads Q3 financial invoices from /finance/invoices/2026-Q3 through the Agent Identity Enforcement Gateway (Requires RFC 9396 RAR user consent & DPoP proof).",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"folder": map[string]any{
+						"type":        "string",
+						"description": "Invoice folder path, default /finance/invoices/2026-Q3",
+					},
+				},
+			},
+		},
+		{
+			"name":        "query_customer_crm",
+			"description": "Queries enterprise customer CRM records through the Agent Identity Gateway (Protected by CAMD/CRM delegation flow).",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"customer_segment": map[string]any{
+						"type":        "string",
+						"description": "Customer segment to query (e.g. enterprise_fintech)",
+					},
+				},
+			},
+		},
+		{
+			"name":        "initiate_vendor_payment",
+			"description": "Initiates an INR NEFT vendor payment transfer. High-sensitivity financial mutation — triggers a live OpenID CIBA Step-Up approval on the user's dashboard!",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"vendor_name": map[string]any{
+						"type":        "string",
+						"description": "Vendor name (e.g. CloudInfra India Pvt Ltd)",
+					},
+					"amount_inr": map[string]any{
+						"type":        "number",
+						"description": "Payment amount in INR (e.g. 45000)",
+					},
+				},
+				"required": []string{"vendor_name", "amount_inr"},
+			},
+		},
+		{
+			"name":        "http_egress_fetch",
+			"description": "Fetches or exports data to an external domain through the Layer 2 Egress Proxy. Unknown hosts outside *.acme.local are blocked and trigger cascading token family revocation.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"target_host": map[string]any{
+						"type":        "string",
+						"description": "Target hostname (e.g. invoices.acme.local or evil-exfil.example)",
+					},
+					"path": map[string]any{
+						"type":        "string",
+						"description": "Target path (e.g. /export-all)",
+					},
+					"action": map[string]any{
+						"type":        "string",
+						"description": "Action type (read, write, export_all, delete)",
+					},
+				},
+				"required": []string{"target_host"},
+			},
+		},
+	}
+}
+
+// serveHTTP runs an MCP Streamable HTTP & SSE server (for MCPJam Inspector, Cursor, etc.) on the specified port.
+func (s *mcpGatewaySession) serveHTTP(port string) {
+	mux := http.NewServeMux()
+
+	handleJSONRPC := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method == http.MethodGet {
+			// SSE endpoint for older MCP SSE clients
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				http.Error(w, "SSE unsupported", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			_, _ = fmt.Fprintf(w, "event: endpoint\ndata: /mcp\n\n")
+			flusher.Flush()
+			<-r.Context().Done()
+			return
+		}
+
+		var req rpcRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		resp := s.buildRPCResponse(req)
+		if resp == nil {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+
+	mux.HandleFunc("/mcp", handleJSONRPC)
+	mux.HandleFunc("/sse", handleJSONRPC)
+	mux.HandleFunc("/message", handleJSONRPC)
+	mux.HandleFunc("/", handleJSONRPC)
+
+	fmt.Fprintf(os.Stderr, "🛡️  Agent Identity MCP Gateway (Streamable HTTP + SSE for MCPJam) listening on http://localhost:%s/mcp\n", port)
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
+		fmt.Fprintf(os.Stderr, "HTTP server failed: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func (s *mcpGatewaySession) postJSON(path string, payload any, dpopHeader string) map[string]any {
