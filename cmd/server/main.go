@@ -5,8 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,36 +43,35 @@ func main() {
 	// =========================================================================
 	// 1. REAL OIDC & OAUTH 2.1 DISCOVERY METADATA & JWKS (RFC 8414 / RFC 7517)
 	// =========================================================================
-	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+	handleOAuthDiscovery := func(w http.ResponseWriter, r *http.Request) {
 		baseURL := "http://localhost:8080"
 		writeJSON(w, http.StatusOK, map[string]any{
-			"issuer":                                             "https://auth.agentidentity.local",
-			"authorization_endpoint":                             baseURL + "/oauth/authorize",
-			"token_endpoint":                                     baseURL + "/oauth/token",
-			"registration_endpoint":                              baseURL + "/oauth/register",
-			"client_id_metadata_document_supported":              true,
-			"dcr_software_statements_supported":                  true,
-			"introspection_endpoint":                             baseURL + "/oauth/introspect",
-			"revocation_endpoint":                                baseURL + "/oauth/revoke",
-			"backchannel_authentication_endpoint":                baseURL + "/oauth/bc-authorize",
-			"jwks_uri":                                           baseURL + "/.well-known/jwks.json",
-			"agent_registration_endpoint":                        baseURL + "/api/v1/agents/register",
-			"gateway_enforcement_endpoint":                       baseURL + "/api/v1/gateway/execute",
-			"risk_decision_endpoint":                             baseURL + "/api/v1/decide",
-			"grant_types_supported":                              []string{"authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:token-exchange", "urn:openid:params:grant-type:ciba"},
-			"response_types_supported":                           []string{"code"},
-			"code_challenge_methods_supported":                   []string{"S256"},
-			"dpop_signing_alg_values_supported":                  []string{"ES256"},
-			"token_endpoint_auth_methods_supported":              []string{"none", "private_key_jwt"},
-			"authorization_details_types_supported":              []string{"file_access", "payment_initiation", "mcp_tool_execution"},
-			"backchannel_token_delivery_modes_supported":         []string{"poll", "ping", "push"},
-			"spiffe_trust_domain":                                "spiffe://acme.in",
+			"issuer":                                     baseURL,
+			"authorization_endpoint":                     baseURL + "/oauth/authorize",
+			"token_endpoint":                             baseURL + "/oauth/token",
+			"registration_endpoint":                      baseURL + "/oauth/register",
+			"client_id_metadata_document_supported":      true,
+			"dcr_software_statements_supported":          true,
+			"introspection_endpoint":                     baseURL + "/oauth/introspect",
+			"revocation_endpoint":                        baseURL + "/oauth/revoke",
+			"backchannel_authentication_endpoint":        baseURL + "/oauth/bc-authorize",
+			"jwks_uri":                                   baseURL + "/.well-known/jwks.json",
+			"agent_registration_endpoint":                baseURL + "/api/v1/agents/register",
+			"gateway_enforcement_endpoint":               baseURL + "/api/v1/gateway/execute",
+			"risk_decision_endpoint":                     baseURL + "/api/v1/decide",
+			"grant_types_supported":                      []string{"authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:token-exchange", "urn:openid:params:grant-type:ciba"},
+			"response_types_supported":                   []string{"code"},
+			"code_challenge_methods_supported":           []string{"S256"},
+			"dpop_signing_alg_values_supported":          []string{"ES256"},
+			"token_endpoint_auth_methods_supported":      []string{"none", "client_secret_post", "private_key_jwt"},
+			"scopes_supported":                           []string{"crm.read", "invoices.read", "payments.transfer", "mcp:tools"},
+			"authorization_details_types_supported":      []string{"file_access", "payment_initiation", "mcp_tool_execution"},
+			"backchannel_token_delivery_modes_supported": []string{"poll", "ping", "push"},
+			"spiffe_trust_domain":                        "spiffe://acme.in",
 		})
-	})
-
-	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/.well-known/openid-configuration", http.StatusTemporaryRedirect)
-	})
+	}
+	mux.HandleFunc("/.well-known/openid-configuration", handleOAuthDiscovery)
+	mux.HandleFunc("/.well-known/oauth-authorization-server", handleOAuthDiscovery)
 
 	mux.HandleFunc("/.well-known/jwks.json", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, km.PublicJWKS())
@@ -109,7 +110,10 @@ func main() {
 			req.UserSub = q.Get("user_sub")
 			req.Task = q.Get("task")
 			req.Scope = q.Get("scope")
-			req.Aud = q.Get("aud")
+			req.Aud = q.Get("resource")
+			if req.Aud == "" {
+				req.Aud = q.Get("aud")
+			}
 			req.CodeChallenge = q.Get("code_challenge")
 		}
 		if req.ClientID == "" {
@@ -194,11 +198,133 @@ func main() {
 			},
 		})
 
+		// If this is a standard OAuth 2.1 browser authorization redirect (e.g. from MCPJam OAuth Debugger, Claude, Gemini),
+		// render an interactive HTML Consent Screen that redirects back to redirect_uri?code=...&state=...
+		redirectURI := r.URL.Query().Get("redirect_uri")
+		state := r.URL.Query().Get("state")
+		if r.Method == http.MethodGet && redirectURI != "" {
+			rec.RedirectURI = redirectURI
+			rec.State = state
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprintf(w, `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Agent Identity — RFC 9396 RAR Consent</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f8fafc; color: #0f172a; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }
+  .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 16px; max-width: 480px; width: 100%%; padding: 28px; box-shadow: 0 20px 45px rgba(15,23,42,0.08); }
+  .badge { display: inline-block; background: #eff6ff; color: #1d4ed8; font-weight: 700; font-size: 11px; letter-spacing: .04em; padding: 4px 10px; border-radius: 999px; text-transform: uppercase; }
+  h1 { font-size: 20px; margin: 12px 0 6px; }
+  p { font-size: 13px; color: #475569; margin: 0 0 18px; line-height: 1.5; }
+  .box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px; font-size: 12px; margin-bottom: 20px; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid #f1f5f9; }
+  .row:last-child { border-bottom: 0; }
+  .k { color: #64748b; font-weight: 600; }
+  .v { color: #0f172a; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; word-break: break-all; }
+  .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  button { cursor: pointer; border: 0; border-radius: 10px; padding: 12px 16px; font-weight: 700; font-size: 13px; }
+  .approve { background: #059669; color: #fff; }
+  .approve:hover { background: #047857; }
+  .deny { background: #fff1f2; color: #be123c; border: 1px solid #fecdd3; }
+  .deny:hover { background: #ffe4e6; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <span class="badge">🛡️ Agent Identity · OAuth 2.1 + PKCE + RAR</span>
+    <h1>Authorize MCP Agent Access</h1>
+    <p>An external AI agent is requesting a short-lived, cryptographically audited access pass through your Agent Identity Gateway.</p>
+    <div class="box">
+      <div class="row"><span class="k">Client ID</span><span class="v">%s</span></div>
+      <div class="row"><span class="k">Consent ID</span><span class="v">%s</span></div>
+      <div class="row"><span class="k">Requested Scope</span><span class="v">%s</span></div>
+      <div class="row"><span class="k">Resource / Aud</span><span class="v">%s</span></div>
+      <div class="row"><span class="k">PKCE S256</span><span class="v">%s</span></div>
+      <div class="row"><span class="k">Redirect URI</span><span class="v">%s</span></div>
+    </div>
+    <form method="POST" action="/oauth/authorize/decision">
+      <input type="hidden" name="consent_id" value="%s" />
+      <input type="hidden" name="redirect_uri" value="%s" />
+      <input type="hidden" name="state" value="%s" />
+      <div class="btns">
+        <button type="submit" name="decision" value="deny" class="deny">Deny Access</button>
+        <button type="submit" name="decision" value="approve" class="approve">Approve &amp; Issue Pass</button>
+      </div>
+    </form>
+  </div>
+</body>
+</html>`,
+				html.EscapeString(req.ClientID),
+				html.EscapeString(rec.ConsentID),
+				html.EscapeString(req.Scope),
+				html.EscapeString(req.Aud),
+				html.EscapeString(req.CodeChallenge),
+				html.EscapeString(redirectURI),
+				html.EscapeString(rec.ConsentID),
+				html.EscapeString(redirectURI),
+				html.EscapeString(state),
+			)
+			return
+		}
+
 		writeJSON(w, http.StatusOK, map[string]any{
 			"consent_record": rec,
 			"issuance_risk":  issuanceRisk,
 			"consent_url":    fmt.Sprintf("http://localhost:3000?consent_id=%s", rec.ConsentID),
 		})
+	})
+
+	// POST /oauth/authorize/decision — Handles the Approve/Deny form from the browser OAuth 2.1 consent screen
+	mux.HandleFunc("/oauth/authorize/decision", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		consentID := r.FormValue("consent_id")
+		redirectURI := r.FormValue("redirect_uri")
+		state := r.FormValue("state")
+		decision := r.FormValue("decision")
+
+		u, err := url.Parse(redirectURI)
+		if err != nil || redirectURI == "" {
+			http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
+			return
+		}
+		q := u.Query()
+		if state != "" {
+			q.Set("state", state)
+		}
+
+		if decision == "approve" {
+			rec, err := authServer.ApproveConsent(consentID, []string{"read"})
+			if err != nil {
+				q.Set("error", "server_error")
+				q.Set("error_description", err.Error())
+			} else {
+				q.Set("code", rec.AuthCode)
+				sseHub.Publish(events.TelemetryEvent{
+					StepNumber: 2,
+					FromLane:   "user",
+					ToLane:     "as",
+					Label:      "OAuth 2.1 Consent Approved (" + rec.AgentID + ")",
+					Who:        rec.UserSub + " → Auth Server",
+					Headline:   "Human Approved OAuth 2.1 + PKCE Consent in Browser",
+					PlainText:  fmt.Sprintf("Issued single-use PKCE auth code %s for %s", rec.AuthCode, rec.AgentID),
+					FlowNode:   "consent",
+					Status:     "ok",
+					StatusText: "Consent Approved",
+					PhonePrompt: &events.PhonePrompt{
+						Type: "dismiss",
+					},
+				})
+			}
+		} else {
+			_, _, _ = authServer.RevokeConsent(consentID)
+			q.Set("error", "access_denied")
+			q.Set("error_description", "User denied agent authorization request")
+		}
+
+		u.RawQuery = q.Encode()
+		http.Redirect(w, r, u.String(), http.StatusFound)
 	})
 
 	// POST /oauth/token — Real multi-grant OAuth 2.1 Token Endpoint:
@@ -221,7 +347,24 @@ func main() {
 			Task                 string                       `json:"task"`
 			AuthorizationDetails []crypto.AuthorizationDetail `json:"authorization_details"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+			_ = r.ParseForm()
+			req.GrantType = r.FormValue("grant_type")
+			req.Code = r.FormValue("code")
+			req.CodeVerifier = r.FormValue("code_verifier")
+			req.RefreshToken = r.FormValue("refresh_token")
+			req.SubjectToken = r.FormValue("subject_token")
+			req.ActorClientID = r.FormValue("actor_client_id")
+			req.ClientID = r.FormValue("client_id")
+			req.UserSub = r.FormValue("user_sub")
+			req.Scope = r.FormValue("scope")
+			req.Aud = r.FormValue("resource")
+			if req.Aud == "" {
+				req.Aud = r.FormValue("aud")
+			}
+		} else {
+			_ = json.NewDecoder(r.Body).Decode(&req)
+		}
 
 		tokenEndpointURL := "http://localhost:8080/oauth/token"
 		if r.Host != "" {
@@ -282,9 +425,13 @@ func main() {
 				FamilyGraph: dag.GetSnapshot(claims.FamilyID),
 			})
 
+			tokType := "Bearer"
+			if dpopHeader != "" {
+				tokType = "DPoP"
+			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"access_token":       jwtStr,
-				"token_type":         "DPoP",
+				"token_type":         tokType,
 				"expires_in":         300,
 				"refresh_token":      refreshJTI,
 				"scope":              claims.Scope,
@@ -475,6 +622,8 @@ func main() {
 			ParentAgentID           string   `json:"parent_agent_id"`
 			Scope                   string   `json:"scope"`
 			GrantTypes              []string `json:"grant_types"`
+			ResponseTypes           []string `json:"response_types"`
+			RedirectURIs            []string `json:"redirect_uris"`
 			TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
 			ModelID                 string   `json:"model_id"`
 			CRMIntegration          string   `json:"crm_integration"`
@@ -541,11 +690,21 @@ func main() {
 			LatencyUs:    118,
 		})
 
+		authMethod := dcrReq.TokenEndpointAuthMethod
+		if authMethod == "" {
+			authMethod = "none"
+		}
+		respTypes := dcrReq.ResponseTypes
+		if len(respTypes) == 0 {
+			respTypes = []string{"code"}
+		}
 		writeJSON(w, http.StatusCreated, map[string]any{
 			"client_id":                  registered.AgentID,
 			"client_name":                registered.Name,
 			"client_id_issued_at":        registered.RegisteredAt,
-			"token_endpoint_auth_method": "dpop_es256",
+			"redirect_uris":              dcrReq.RedirectURIs,
+			"response_types":             respTypes,
+			"token_endpoint_auth_method": authMethod,
 			"grant_types":                []string{"authorization_code", "urn:ietf:params:oauth:grant-type:token-exchange", "refresh_token"},
 			"scope":                      dcrReq.Scope,
 			"spiffe_id":                  registered.SPIFFEID,

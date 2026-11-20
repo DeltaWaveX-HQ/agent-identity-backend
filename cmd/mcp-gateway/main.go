@@ -628,7 +628,7 @@ func (s *mcpGatewaySession) serveHTTP(port string) {
 	handleSSE := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, Authorization, DPoP")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -685,7 +685,7 @@ func (s *mcpGatewaySession) serveHTTP(port string) {
 	handleMessage := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, Authorization, DPoP")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -848,6 +848,66 @@ func (s *mcpGatewaySession) serveHTTP(port string) {
 		}
 	}
 
+	handleProtectedResourceMetadata := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization, Mcp-Session-Id, DPoP")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		suffix := strings.TrimPrefix(r.URL.Path, "/.well-known/oauth-protected-resource")
+		resourceURL := fmt.Sprintf("http://localhost:%s%s", port, suffix)
+		if suffix == "" || suffix == "/" {
+			resourceURL = fmt.Sprintf("http://localhost:%s/sse", port)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"resource":                 resourceURL,
+			"authorization_servers":    []string{"http://localhost:8080"},
+			"scopes_supported":         []string{"crm.read", "invoices.read", "payments.transfer", "mcp:tools"},
+			"bearer_methods_supported": []string{"header"},
+			"resource_name":            "Agent Identity Enforcement Gateway (MCP)",
+			"resource_documentation":   "http://localhost:3000",
+		})
+	}
+
+	handleAuthServerMetadata := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization, Mcp-Session-Id, DPoP")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		asBase := "http://localhost:8080"
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"issuer":                                asBase,
+			"authorization_endpoint":                asBase + "/oauth/authorize",
+			"token_endpoint":                        asBase + "/oauth/token",
+			"registration_endpoint":                 asBase + "/oauth/register",
+			"introspection_endpoint":                asBase + "/oauth/introspect",
+			"revocation_endpoint":                   asBase + "/oauth/revoke",
+			"jwks_uri":                              asBase + "/.well-known/jwks.json",
+			"response_types_supported":              []string{"code"},
+			"grant_types_supported":                 []string{"authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:token-exchange"},
+			"code_challenge_methods_supported":      []string{"S256"},
+			"token_endpoint_auth_methods_supported": []string{"none", "client_secret_post", "private_key_jwt"},
+			"scopes_supported":                      []string{"crm.read", "invoices.read", "payments.transfer", "mcp:tools"},
+			"dpop_signing_alg_values_supported":     []string{"ES256"},
+			"client_id_metadata_document_supported": true,
+		})
+	}
+
+	// RFC 9728 Protected Resource Metadata & RFC 8414 Authorization Server Metadata (MCP 2025-11-25 OAuth spec)
+	mux.HandleFunc("/.well-known/oauth-protected-resource", handleProtectedResourceMetadata)
+	mux.HandleFunc("/.well-known/oauth-protected-resource/", handleProtectedResourceMetadata)
+	mux.HandleFunc("/.well-known/oauth-authorization-server", handleAuthServerMetadata)
+	mux.HandleFunc("/.well-known/oauth-authorization-server/", handleAuthServerMetadata)
+	mux.HandleFunc("/.well-known/openid-configuration", handleAuthServerMetadata)
+	mux.HandleFunc("/.well-known/openid-configuration/", handleAuthServerMetadata)
+
 	// Register routes for MCP over SSE and HTTP
 	mux.HandleFunc("/sse", handleSSE)
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
@@ -859,6 +919,10 @@ func (s *mcpGatewaySession) serveHTTP(port string) {
 	})
 	mux.HandleFunc("/message", handleMessage)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/.well-known/") {
+			http.NotFound(w, r)
+			return
+		}
 		if r.Method == http.MethodGet {
 			handleSSE(w, r)
 		} else {
