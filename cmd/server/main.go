@@ -1050,6 +1050,54 @@ func main() {
 		writeJSON(w, resp.HTTPStatus, resp)
 	})
 
+	// POST /api/v1/live-llm/run — Real Gemini API / Anthropic Claude API Function-Calling Connector with Layer 2 Gateway in the Middle!
+	mux.HandleFunc("/api/v1/live-llm/run", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Provider  string `json:"provider"` // "gemini" | "claude"
+			APIKey    string `json:"api_key"`
+			Model     string `json:"model"`
+			UserEmail string `json:"user_email"`
+			Prompt    string `json:"prompt"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if req.APIKey == "" {
+			if req.Provider == "claude" {
+				req.APIKey = os.Getenv("ANTHROPIC_API_KEY")
+			} else {
+				req.APIKey = os.Getenv("GEMINI_API_KEY")
+			}
+		}
+		if req.APIKey == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "Please provide your real Gemini API Key or Anthropic Claude API Key (or use the built-in MCP Gateway binary in Claude Code / Gemini CLI).",
+			})
+			return
+		}
+		if req.UserEmail == "" {
+			req.UserEmail = "ajay@deltawavex.in"
+		}
+		if req.Model == "" {
+			if req.Provider == "claude" {
+				req.Model = "claude-3-5-sonnet-latest"
+			} else {
+				req.Model = "gemini-2.5-flash"
+			}
+		}
+
+		// Run the live LLM tool-calling session in a goroutine so the UI can approve the real-time RAR consent popup!
+		go runRealLLMAgentWithGateway(req.Provider, req.APIKey, req.Model, req.UserEmail, req.Prompt, authServer, dag, riskEngine, enfGateway, dataStore, sseHub)
+
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"status":   "started_real_llm_agent",
+			"provider": req.Provider,
+			"model":    req.Model,
+			"message":  "Connecting to real " + strings.ToUpper(req.Provider) + " API... Approve the live RAR consent popup when the LLM requests a tool call!",
+		})
+	})
+
 	// =========================================================================
 	// 6. EMERGENCY KILL SWITCH, SSE STREAM, SCENARIOS & 25-INCIDENT BENCHMARK
 	// =========================================================================

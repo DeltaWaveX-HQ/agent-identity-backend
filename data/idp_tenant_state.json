@@ -1,6 +1,40 @@
 {
-  "users": [],
-  "organizations": [],
+  "users": [
+    {
+      "id": "usr_uCf5JjyQ",
+      "email": "agent1@yopmail.com",
+      "password": "agent1@yopmail.com",
+      "name": "Ajaykumar",
+      "role": "Organization Owner",
+      "org_id": "org_9J6vCN4v",
+      "org_name": "ajay-test",
+      "org_domain": "ajay-test.agentidentity.local",
+      "allowed_scopes": [
+        "crm.read",
+        "crm.write",
+        "invoices.read",
+        "payments.transfer",
+        "files.read",
+        "mcp.tools.execute"
+      ],
+      "created_at": 1795156370
+    }
+  ],
+  "organizations": [
+    {
+      "id": "org_9J6vCN4v",
+      "name": "ajay-test",
+      "slug": "ajay-test",
+      "domain": "ajay-test.agentidentity.local",
+      "owner_email": "agent1@yopmail.com",
+      "dcr_enabled": true,
+      "camd_enabled": true,
+      "crm_enabled": true,
+      "dpop_enabled": true,
+      "ciba_enabled": true,
+      "created_at": 1795156370
+    }
+  ],
   "policies": [
     {
       "id": "pol_egress_allowlist",
