@@ -79,7 +79,7 @@ type Server struct {
 }
 
 func NewServer(km *crypto.KeyManager, dag *FamilyDAG) *Server {
-	s := &Server{
+	return &Server{
 		km:           km,
 		dag:          dag,
 		agents:       make(map[string]*RegisteredAgent),
@@ -87,8 +87,6 @@ func NewServer(km *crypto.KeyManager, dag *FamilyDAG) *Server {
 		codes:        make(map[string]*ConsentRecord),
 		cibaRequests: make(map[string]*CIBARequest),
 	}
-	s.seedDefaultAgents()
-	return s
 }
 
 func (s *Server) seedDefaultAgents() {
@@ -144,12 +142,12 @@ func (s *Server) seedDefaultAgents() {
 
 func (s *Server) Reset() {
 	s.mu.Lock()
+	s.agents = make(map[string]*RegisteredAgent)
 	s.consents = make(map[string]*ConsentRecord)
 	s.codes = make(map[string]*ConsentRecord)
 	s.cibaRequests = make(map[string]*CIBARequest)
 	s.mu.Unlock()
 	s.dag.Reset()
-	s.seedDefaultAgents()
 }
 
 func (s *Server) RegisterAgent(req RegisteredAgent) (*RegisteredAgent, error) {

@@ -159,6 +159,41 @@ func main() {
 			LatencyUs: issuanceRisk.LatencyUs,
 		})
 
+		var locs, acts []string
+		if len(req.AuthorizationDetails) > 0 {
+			locs = req.AuthorizationDetails[0].Locations
+			acts = req.AuthorizationDetails[0].Actions
+		}
+		sseHub.Publish(events.TelemetryEvent{
+			StepNumber:   1,
+			FromLane:     "agent",
+			ToLane:       "user",
+			Label:        "RAR Consent Request (" + req.ClientID + ")",
+			Who:          req.ClientID + " → " + req.UserSub,
+			Headline:     "External AI Agent requesting RFC 9396 RAR Consent",
+			PlainText:    fmt.Sprintf("Agent '%s' wants to access %v with actions %v for task: %s", req.ClientID, locs, acts, req.Task),
+			UnderTheHood: fmt.Sprintf("POST /oauth/authorize · consent_id=%s · Stage 1 Risk=%.2f", rec.ConsentID, issuanceRisk.Score),
+			FlowNode:     "consent",
+			Status:       "warn",
+			StatusText:   "Awaiting Your Consent",
+			LatencyUs:    issuanceRisk.LatencyUs,
+			RiskDecision: issuanceRisk,
+			PhonePrompt: &events.PhonePrompt{
+				PromptID:          rec.ConsentID,
+				Type:              "rar_consent",
+				Title:             "Live Agent Consent Request (RFC 9396 RAR)",
+				User:              req.UserSub,
+				AgentID:           req.ClientID,
+				TaskDescription:   req.Task,
+				RequestedResource: strings.Join(locs, ", "),
+				RequestedActions:  acts,
+				TTLDisplay:        "5 minutes (DPoP Sender-Constrained)",
+				RiskScore:         issuanceRisk.Score,
+				RiskReasons:       issuanceRisk.TopReasons,
+				ExpiresInSeconds:  120,
+			},
+		})
+
 		writeJSON(w, http.StatusOK, map[string]any{
 			"consent_record": rec,
 			"issuance_risk":  issuanceRisk,
@@ -218,6 +253,26 @@ func main() {
 				TokenJTI:  claims.JTI,
 				FamilyID:  claims.FamilyID,
 				LatencyUs: 210,
+			})
+
+			sseHub.Publish(events.TelemetryEvent{
+				StepNumber:  2,
+				FromLane:    "as",
+				ToLane:      "agent",
+				Label:       "Issued DPoP Token (" + claims.ClientID + ")",
+				Who:         "Auth Server → " + claims.ClientID,
+				Headline:    "Issued 5-Min ES256 DPoP-Bound Access Token to Your Agent",
+				PlainText:   fmt.Sprintf("Minted token %s for agent '%s' after your consent approval.", claims.JTI, claims.ClientID),
+				UnderTheHood: fmt.Sprintf("POST /oauth/token (grant_type=authorization_code) · Family=%s · cnf.jkt=%s", claims.FamilyID, jkt),
+				FlowNode:    "token",
+				Status:      "ok",
+				StatusText:  "Token Minted",
+				LatencyUs:   210,
+				TokenRaw:    jwtStr,
+				TokenClaims: claims,
+				DPoPRaw:     dpopProof,
+				DPoPClaims:  dpopClaims,
+				FamilyGraph: dag.GetSnapshot(claims.FamilyID),
 			})
 
 			writeJSON(w, http.StatusOK, map[string]any{
@@ -456,6 +511,21 @@ func main() {
 			LatencyUs: 118,
 		})
 
+		sseHub.Publish(events.TelemetryEvent{
+			StepNumber:   1,
+			FromLane:     "agent",
+			ToLane:       "as",
+			Label:        "DCR Auto-Register: " + registered.AgentID,
+			Who:          registered.AgentID + " → Auth Server",
+			Headline:     "External Agent Auto-Registered via RFC 7591 DCR",
+			PlainText:    fmt.Sprintf("Agent '%s' (Model: %s) attested SPIFFE ID %s and bound DPoP key cnf.jkt=%s", registered.Name, registered.ModelID, registered.SPIFFEID, registered.DPoPThumbprint),
+			UnderTheHood: "POST /oauth/register · RFC 7591 Dynamic Client Registration",
+			FlowNode:     "attest",
+			Status:       "ok",
+			StatusText:   "DCR Registered",
+			LatencyUs:    118,
+		})
+
 		writeJSON(w, http.StatusCreated, map[string]any{
 			"client_id":                  registered.AgentID,
 			"client_name":                registered.Name,
@@ -515,6 +585,21 @@ func main() {
 			LatencyUs: 142,
 		})
 
+		sseHub.Publish(events.TelemetryEvent{
+			StepNumber:   1,
+			FromLane:     "agent",
+			ToLane:       "as",
+			Label:        "CAMD/CIMD Discovery: " + registered.Name,
+			Who:          registered.AgentID + " → Auth Server",
+			Headline:     "External Agent Discovered via CAMD / CIMD Metadata URL",
+			PlainText:    fmt.Sprintf("Fetched metadata from %s and bound CRM scopes for %s", req.MetadataURL, req.CRMTarget),
+			UnderTheHood: "POST /oauth/cimd-discover · IETF Client ID Metadata Document",
+			FlowNode:     "attest",
+			Status:       "ok",
+			StatusText:   "CAMD Bound",
+			LatencyUs:    142,
+		})
+
 		writeJSON(w, http.StatusOK, map[string]any{
 			"client_id":          registered.AgentID,
 			"metadata_document": map[string]any{
@@ -556,23 +641,87 @@ func main() {
 	})
 
 	// =========================================================================
-	// 3. USER AUTHENTICATION, TENANT DIRECTORY, AGENT INVENTORY & CONSENTS
+	// 3. USER SIGNUP, LOGIN, ORGANIZATIONS, AGENT INVENTORY & CONSENTS
 	// =========================================================================
+	mux.HandleFunc("/api/v1/auth/signup", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Name      string `json:"name"`
+			Email     string `json:"email"`
+			Password  string `json:"password"`
+			OrgName   string `json:"org_name"`
+			OrgDomain string `json:"org_domain"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		user, org, sessionTok, err := dataStore.RegisterUserAndOrg(body.Name, body.Email, body.Password, body.OrgName, body.OrgDomain)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		// Reset runtime agents/logs so the new organization starts 100% clean with 0 pre-filled data
+		authServer.Reset()
+		sseHub.ClearHistory()
+		dataStore.ClearOrgActivity(org.ID)
+
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"user":          user,
+			"organization":  org,
+			"session_token": sessionTok,
+		})
+	})
+
 	mux.HandleFunc("/api/v1/auth/login", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Email    string `json:"email"`
 			Password string `json:"password"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		user, sessionTok, ok := dataStore.Authenticate(body.Email, body.Password)
+		user, org, sessionTok, ok := dataStore.Authenticate(body.Email, body.Password)
 		if !ok {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Invalid email or password. If you haven't created an account yet, click 'Create Account & Organization'."})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"user":          user,
+			"organization":  org,
 			"session_token": sessionTok,
 		})
+	})
+
+	mux.HandleFunc("/api/v1/orgs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var body struct {
+				OwnerEmail string `json:"owner_email"`
+				OrgName    string `json:"org_name"`
+				OrgDomain  string `json:"org_domain"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			org := dataStore.CreateOrganization(body.OwnerEmail, body.OrgName, body.OrgDomain)
+			authServer.Reset()
+			sseHub.ClearHistory()
+			dataStore.ClearOrgActivity(org.ID)
+			writeJSON(w, http.StatusCreated, org)
+			return
+		}
+		email := r.URL.Query().Get("owner_email")
+		writeJSON(w, http.StatusOK, dataStore.ListOrganizations(email))
+	})
+
+	mux.HandleFunc("/api/v1/workspace/reset", func(w http.ResponseWriter, r *http.Request) {
+		authServer.Reset()
+		sseHub.ClearHistory()
+		dataStore.ClearOrgActivity("")
+		writeJSON(w, http.StatusOK, map[string]string{"status": "workspace_cleared"})
+	})
+
+	// GET /api/v1/oauth/consent-status?consent_id=... — Allows external Claude/Gemini CLI agent scripts to poll until the user clicks Approve in the dashboard!
+	mux.HandleFunc("/api/v1/oauth/consent-status", func(w http.ResponseWriter, r *http.Request) {
+		cid := r.URL.Query().Get("consent_id")
+		rec, ok := authServer.GetConsent(cid)
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "consent_not_found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, rec)
 	})
 
 	mux.HandleFunc("/api/v1/users", func(w http.ResponseWriter, r *http.Request) {
@@ -872,6 +1021,32 @@ func main() {
 			LatencyUs:  resp.GatewayLatencyUs,
 		})
 
+		gwStatus := "ok"
+		if !resp.Allowed {
+			gwStatus = "bad"
+			if resp.Verdict == risk.VerdictStepUpCIBA {
+				gwStatus = "warn"
+			}
+		}
+		sseHub.Publish(events.TelemetryEvent{
+			StepNumber:   3,
+			FromLane:     "agent",
+			ToLane:       "gw",
+			Label:        fmt.Sprintf("%s %s (%s)", req.HTTPMethod, req.ResourcePath, resp.Verdict),
+			Who:          fmt.Sprintf("%s → Gateway → %s", agentID, req.TargetHost),
+			Headline:     fmt.Sprintf("Live Agent Gateway Call: %s %s → HTTP %d", req.HTTPMethod, req.TargetURI, resp.HTTPStatus),
+			PlainText:    fmt.Sprintf("Agent '%s' (acting for %s) called %s. Verdict: %s (Risk Score: %.2f)", agentID, actorUser, req.TargetURI, resp.Verdict, score),
+			UnderTheHood: fmt.Sprintf("POST /api/v1/gateway/execute · JTI=%s · Latency=%d µs", jti, resp.GatewayLatencyUs),
+			FlowNode:     "runtime",
+			Status:       gwStatus,
+			StatusText:   fmt.Sprintf("HTTP %d %s", resp.HTTPStatus, strings.ToUpper(string(resp.Verdict))),
+			LatencyUs:    resp.GatewayLatencyUs,
+			TokenClaims:  resp.VerifiedTokenClaims,
+			DPoPClaims:   resp.VerifiedDPoPClaims,
+			RiskDecision: resp.RiskDecision,
+			FamilyGraph:  resp.FamilyGraph,
+		})
+
 		writeJSON(w, resp.HTTPStatus, resp)
 	})
 
@@ -979,9 +1154,7 @@ func main() {
 		})
 	})
 
-	// Seed an initial live token family & audit history on boot
-	orchestrator.RunScenario("act1_normal", false, 15*time.Millisecond)
-
+	// Start clean with 0 pre-filled demo runs so the user sees only their own real agent connections!
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"

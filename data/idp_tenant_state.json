@@ -1,213 +1,63 @@
 {
-  "users": [
-    {
-      "id": "usr_priya_01",
-      "email": "priya@acme.in",
-      "password": "acme2026",
-      "name": "Priya Sharma",
-      "role": "Finance Manager",
-      "tenant_id": "tnt_acme_india",
-      "tenant_name": "Acme FinTech India Ltd.",
-      "department": "Finance \u0026 Treasury",
-      "allowed_scopes": [
-        "invoices.read",
-        "invoices.summarize",
-        "payments.transfer",
-        "crm.read"
-      ],
-      "created_at": 1791267064
-    },
-    {
-      "id": "usr_ajay_admin",
-      "email": "admin@acme.in",
-      "password": "admin2026",
-      "name": "Ajay Kumar (CISO)",
-      "role": "CISO / Admin",
-      "tenant_id": "tnt_acme_india",
-      "tenant_name": "Acme FinTech India Ltd.",
-      "department": "Security \u0026 Identity Operations",
-      "allowed_scopes": [
-        "invoices.read",
-        "payments.transfer",
-        "crm.read",
-        "admin.policies",
-        "admin.revoke"
-      ],
-      "created_at": 1784787064
-    },
-    {
-      "id": "usr_dev_rahul",
-      "email": "rahul@acme.in",
-      "password": "dev2026",
-      "name": "Rahul Verma",
-      "role": "AI Platform Engineer",
-      "tenant_id": "tnt_acme_india",
-      "tenant_name": "Acme FinTech India Ltd.",
-      "department": "AI \u0026 MCP Engineering",
-      "allowed_scopes": [
-        "invoices.read",
-        "repos.pr.create",
-        "mcp.tools.execute"
-      ],
-      "created_at": 1793859064
-    }
-  ],
+  "users": [],
+  "organizations": [],
   "policies": [
     {
       "id": "pol_egress_allowlist",
       "name": "Default-Deny Unknown Egress Hosts",
       "code": "RULE_DEFAULT_DENY_UNKNOWN_EGRESS",
-      "description": "Blocks any agent HTTP or MCP tool call targeting an external host outside the tenant's verified allowlist (*.acme.local).",
-      "cedar_expr": "forbid (principal, action, resource) unless { resource.host in [\"gw.acme.local\", \"invoices.acme.local\", \"payments.acme.local\", \"crm.acme.local\"] };",
+      "description": "Blocks any agent HTTP or MCP tool call targeting an external host outside your organization's verified domain allowlist.",
+      "cedar_expr": "forbid (principal, action, resource) unless { resource.host in context.org_allowed_hosts };",
       "action": "BLOCK_AND_REVOKE",
       "enabled": true,
       "category": "Egress",
-      "hits_count": 14
+      "hits_count": 0
     },
     {
       "id": "pol_oversight_protect",
       "name": "Protect Safety Monitoring \u0026 Alerting Configs",
       "code": "RULE_PROTECT_OVERSIGHT_CONFIG",
-      "description": "Prevents autonomous coding or ops agents from disabling or modifying security monitoring and alerting pipelines (stops OpenAI GPT-6 monitor-disable incident).",
+      "description": "Prevents autonomous coding or ops agents from disabling or modifying security monitoring and alerting pipelines.",
       "cedar_expr": "forbid (principal is Agent, action in [Action::\"write\", Action::\"delete\"], resource) when { resource.path like \"/monitoring/*\" || resource.path like \"/alerts/*\" };",
       "action": "BLOCK_AND_REVOKE",
       "enabled": true,
       "category": "Oversight",
-      "hits_count": 3
+      "hits_count": 0
     },
     {
       "id": "pol_no_destructive",
       "name": "Forbid Autonomous Destructive Deletes",
       "code": "RULE_NEVER_DELETE_DESTRUCTIVE",
-      "description": "Hard tenant guardrail preventing any AI agent or sub-agent from executing destructive delete or drop_table operations without human intervention.",
+      "description": "Hard guardrail preventing any AI agent or sub-agent from executing destructive delete or drop_table operations without human intervention.",
       "cedar_expr": "forbid (principal is Agent, action in [Action::\"delete\", Action::\"drop_table\"], resource);",
       "action": "BLOCK_AND_REVOKE",
       "enabled": true,
       "category": "Oversight",
-      "hits_count": 5
+      "hits_count": 0
     },
     {
       "id": "pol_unissued_cred",
       "name": "Block Unissued / Stolen Static Credentials",
       "code": "RULE_UNISSUED_CREDENTIAL_BLOCK",
-      "description": "Rejects any outbound request carrying an API key or bearer token that was not dynamically minted for the active attested run (stops CERT-In \u0026 LiteLLM key leaks).",
+      "description": "Rejects any outbound request carrying an API key or bearer token that was not dynamically minted for the active attested run.",
       "cedar_expr": "forbid (principal is Agent, action, resource) when { !context.credential_issued_to_run || !context.dpop_verified };",
       "action": "BLOCK_AND_REVOKE",
       "enabled": true,
       "category": "Egress",
-      "hits_count": 8
+      "hits_count": 0
     },
     {
       "id": "pol_ciba_financial",
-      "name": "Require OpenID CIBA Step-Up for Financial Transfers",
+      "name": "Require OpenID CIBA Step-Up for High-Risk Actions",
       "code": "RULE_CIBA_FINANCIAL_STEP_UP",
-      "description": "Holds any payment initiation or money-movement call (score 0.30–0.75) and dispatches an asynchronous OpenID CIBA push notification to the human owner's device.",
-      "cedar_expr": "permit (principal is Agent, action == Action::\"payment_transfer\", resource) when { context.ciba_human_approved == true \u0026\u0026 context.data_residency == \"IN\" };",
+      "description": "Holds any high-sensitivity mutation or money-movement call (score 0.30–0.75) and dispatches a live approval request to the dashboard.",
+      "cedar_expr": "permit (principal is Agent, action == Action::\"payment_transfer\", resource) when { context.ciba_human_approved == true };",
       "action": "STEP_UP_CIBA",
       "enabled": true,
       "category": "Financial",
-      "hits_count": 9
-    },
-    {
-      "id": "pol_india_residency",
-      "name": "CERT-In \u0026 RBI India Data Residency Enforcement",
-      "code": "RULE_INDIA_DATA_RESIDENCY",
-      "description": "Ensures financial and PII payloads tagged with India residency ('IN') cannot be routed to non-Indian endpoints or unverified third-party LLMs.",
-      "cedar_expr": "forbid (principal is Agent, action, resource) when { resource.data_residency == \"IN\" \u0026\u0026 context.destination_region != \"ap-south-1\" };",
-      "action": "BLOCK_AND_REVOKE",
-      "enabled": true,
-      "category": "Data Residency",
-      "hits_count": 4
+      "hits_count": 0
     }
   ],
-  "gateway_routes": [
-    {
-      "id": "rt_invoices_mcp",
-      "name": "Q3 Finance Invoices MCP Server",
-      "upstream_host": "invoices.acme.local",
-      "path_prefix": "/finance/invoices/2026-Q3",
-      "required_scope": "invoices.read",
-      "sensitivity": "LOW",
-      "data_residency": "IN (Mumbai ap-south-1)",
-      "require_dpop": true,
-      "step_up_threshold": 0.3,
-      "block_threshold": 0.75,
-      "allowed_actions": [
-        "read",
-        "list",
-        "summarize"
-      ]
-    },
-    {
-      "id": "rt_payments_neft",
-      "name": "Treasury NEFT / RTGS Payment API",
-      "upstream_host": "payments.acme.local",
-      "path_prefix": "/payments/transfer",
-      "required_scope": "payments.transfer",
-      "sensitivity": "HIGH_FINANCIAL",
-      "data_residency": "IN (Mumbai ap-south-1)",
-      "require_dpop": true,
-      "step_up_threshold": 0.3,
-      "block_threshold": 0.75,
-      "allowed_actions": [
-        "payment_transfer"
-      ]
-    },
-    {
-      "id": "rt_crm_customers",
-      "name": "Enterprise Customer CRM API",
-      "upstream_host": "crm.acme.local",
-      "path_prefix": "/crm/customers",
-      "required_scope": "crm.read",
-      "sensitivity": "LOW",
-      "data_residency": "IN (Mumbai ap-south-1)",
-      "require_dpop": true,
-      "step_up_threshold": 0.3,
-      "block_threshold": 0.75,
-      "allowed_actions": [
-        "read"
-      ]
-    },
-    {
-      "id": "rt_oversight_config",
-      "name": "SecOps Monitoring \u0026 Alerting Control Plane",
-      "upstream_host": "gw.acme.local",
-      "path_prefix": "/monitoring/alerts",
-      "required_scope": "admin.policies",
-      "sensitivity": "CRITICAL_OVERSIGHT",
-      "data_residency": "IN (Mumbai ap-south-1)",
-      "require_dpop": true,
-      "step_up_threshold": 0.2,
-      "block_threshold": 0.5,
-      "allowed_actions": [
-        "read"
-      ]
-    }
-  ],
-  "audit_logs": [
-    {
-      "id": "aud_rtjUikD7",
-      "timestamp": "2026-11-20T06:12:59Z",
-      "actor_user": "admin@acme.in",
-      "agent_id": "ALL_ACTIVE_FAMILIES",
-      "event_type": "FAMILY_KILL_SWITCH",
-      "method": "POST /api/v1/revoke",
-      "resource": "Emergency SecOps Kill Switch Triggered from Agent Identity Command Center",
-      "risk_score": 1,
-      "verdict": "block_and_revoke",
-      "latency_us": 24
-    },
-    {
-      "id": "aud_5XC2OuVR",
-      "timestamp": "2026-11-20T06:12:57Z",
-      "actor_user": "admin@acme.in",
-      "agent_id": "ALL_ACTIVE_FAMILIES",
-      "event_type": "FAMILY_KILL_SWITCH",
-      "method": "POST /api/v1/revoke",
-      "resource": "Emergency SecOps Kill Switch Triggered from Agent Identity Command Center",
-      "risk_score": 1,
-      "verdict": "block_and_revoke",
-      "latency_us": 24
-    }
-  ]
+  "gateway_routes": [],
+  "audit_logs": []
 }

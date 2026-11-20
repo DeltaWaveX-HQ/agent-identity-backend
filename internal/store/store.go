@@ -4,8 +4,10 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -15,62 +17,80 @@ type User struct {
 	Email         string   `json:"email"`
 	Password      string   `json:"password,omitempty"`
 	Name          string   `json:"name"`
-	Role          string   `json:"role"` // "CISO / Admin" | "Finance Manager" | "AI Engineer"
-	TenantID      string   `json:"tenant_id"`
-	TenantName    string   `json:"tenant_name"`
-	Department    string   `json:"department"`
+	Role          string   `json:"role"`
+	OrgID         string   `json:"org_id"`
+	OrgName       string   `json:"org_name"`
+	OrgDomain     string   `json:"org_domain"`
 	AllowedScopes []string `json:"allowed_scopes"`
 	CreatedAt     int64    `json:"created_at"`
 }
 
+type Organization struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Slug        string `json:"slug"`
+	Domain      string `json:"domain"`
+	OwnerEmail  string `json:"owner_email"`
+	DCREnabled  bool   `json:"dcr_enabled"`
+	CAMDEnabled bool   `json:"camd_enabled"`
+	CRMEnabled  bool   `json:"crm_enabled"`
+	DPoPEnabled bool   `json:"dpop_enabled"`
+	CIBAEnabled bool   `json:"ciba_enabled"`
+	CreatedAt   int64  `json:"created_at"`
+}
+
 type PolicyRule struct {
 	ID          string `json:"id"`
+	OrgID       string `json:"org_id,omitempty"`
 	Name        string `json:"name"`
 	Code        string `json:"code"`
 	Description string `json:"description"`
 	CedarExpr   string `json:"cedar_expr"`
 	Action      string `json:"action"` // "BLOCK_AND_REVOKE" | "STEP_UP_CIBA"
 	Enabled     bool   `json:"enabled"`
-	Category    string `json:"category"` // "Egress" | "Data Residency" | "Oversight" | "Financial"
+	Category    string `json:"category"`
 	HitsCount   int    `json:"hits_count"`
 }
 
 type AuditLogEntry struct {
-	ID           string   `json:"id"`
-	Timestamp    string   `json:"timestamp"`
-	ActorUser    string   `json:"actor_user"`
-	AgentID      string   `json:"agent_id"`
-	ParentAgent  string   `json:"parent_agent,omitempty"`
-	EventType    string   `json:"event_type"` // "AGENT_REGISTER" | "RAR_CONSENT" | "TOKEN_ISSUED" | "RFC8693_EXCHANGE" | "GATEWAY_ALLOW" | "GATEWAY_STEP_UP" | "GATEWAY_BLOCK" | "FAMILY_REVOKE"
-	Method       string   `json:"method,omitempty"`
-	Resource     string   `json:"resource"`
-	TargetHost   string   `json:"target_host,omitempty"`
-	RiskScore    float64  `json:"risk_score"`
-	Verdict      string   `json:"verdict"`
-	PolicyRule   string   `json:"policy_rule,omitempty"`
-	Reasons      []string `json:"reasons,omitempty"`
-	DPoPJKT      string   `json:"dpop_jkt,omitempty"`
-	TokenJTI     string   `json:"token_jti,omitempty"`
-	FamilyID     string   `json:"family_id,omitempty"`
-	LatencyUs    int64    `json:"latency_us"`
+	ID          string   `json:"id"`
+	OrgID       string   `json:"org_id,omitempty"`
+	Timestamp   string   `json:"timestamp"`
+	ActorUser   string   `json:"actor_user"`
+	AgentID     string   `json:"agent_id"`
+	ParentAgent string   `json:"parent_agent,omitempty"`
+	EventType   string   `json:"event_type"`
+	Method      string   `json:"method,omitempty"`
+	Resource    string   `json:"resource"`
+	TargetHost  string   `json:"target_host,omitempty"`
+	RiskScore   float64  `json:"risk_score"`
+	Verdict     string   `json:"verdict"`
+	PolicyRule  string   `json:"policy_rule,omitempty"`
+	Reasons     []string `json:"reasons,omitempty"`
+	DPoPJKT     string   `json:"dpop_jkt,omitempty"`
+	TokenJTI    string   `json:"token_jti,omitempty"`
+	FamilyID    string   `json:"family_id,omitempty"`
+	LatencyUs   int64    `json:"latency_us"`
 }
 
 type GatewayRoute struct {
-	ID               string   `json:"id"`
-	Name             string   `json:"name"`
-	UpstreamHost     string   `json:"upstream_host"`
-	PathPrefix       string   `json:"path_prefix"`
-	RequiredScope    string   `json:"required_scope"`
-	Sensitivity      string   `json:"sensitivity"` // "LOW" | "HIGH_FINANCIAL" | "CRITICAL_OVERSIGHT"
-	DataResidency    string   `json:"data_residency"`
-	RequireDPoP      bool     `json:"require_dpop"`
-	StepUpThreshold  float64  `json:"step_up_threshold"`
-	BlockThreshold   float64  `json:"block_threshold"`
-	AllowedActions   []string `json:"allowed_actions"`
+	ID              string   `json:"id"`
+	OrgID           string   `json:"org_id,omitempty"`
+	Name            string   `json:"name"`
+	UpstreamHost    string   `json:"upstream_host"`
+	PathPrefix      string   `json:"path_prefix"`
+	RequiredScope   string   `json:"required_scope"`
+	Sensitivity     string   `json:"sensitivity"`
+	DataResidency   string   `json:"data_residency"`
+	RequireDPoP     bool     `json:"require_dpop"`
+	StepUpThreshold float64  `json:"step_up_threshold"`
+	BlockThreshold  float64  `json:"block_threshold"`
+	AllowedActions  []string `json:"allowed_actions"`
 }
 
 type PersistedState struct {
 	Users         []*User          `json:"users"`
+	Organizations []*Organization  `json:"organizations"`
 	Policies      []*PolicyRule    `json:"policies"`
 	GatewayRoutes []*GatewayRoute  `json:"gateway_routes"`
 	AuditLogs     []*AuditLogEntry `json:"audit_logs"`
@@ -89,194 +109,256 @@ func NewDataStore(dataDir string) *DataStore {
 		filePath: fp,
 		sessions: make(map[string]*User),
 	}
-	if err := ds.load(); err != nil || len(ds.state.Users) == 0 {
-		ds.seedDefaults()
+	if err := ds.load(); err != nil {
+		ds.seedGuardrailTemplates()
 		_ = ds.save()
 	}
 	return ds
 }
 
-func (ds *DataStore) seedDefaults() {
-	now := time.Now().Unix()
-	ds.state.Users = []*User{
-		{
-			ID:            "usr_priya_01",
-			Email:         "priya@acme.in",
-			Password:      "acme2026",
-			Name:          "Priya Sharma",
-			Role:          "Finance Manager",
-			TenantID:      "tnt_acme_india",
-			TenantName:    "Acme FinTech India Ltd.",
-			Department:    "Finance & Treasury",
-			AllowedScopes: []string{"invoices.read", "invoices.summarize", "payments.transfer", "crm.read"},
-			CreatedAt:     now - 86400*45,
-		},
-		{
-			ID:            "usr_ajay_admin",
-			Email:         "admin@acme.in",
-			Password:      "admin2026",
-			Name:          "Ajay Kumar (CISO)",
-			Role:          "CISO / Admin",
-			TenantID:      "tnt_acme_india",
-			TenantName:    "Acme FinTech India Ltd.",
-			Department:    "Security & Identity Operations",
-			AllowedScopes: []string{"invoices.read", "payments.transfer", "crm.read", "admin.policies", "admin.revoke"},
-			CreatedAt:     now - 86400*120,
-		},
-		{
-			ID:            "usr_dev_rahul",
-			Email:         "rahul@acme.in",
-			Password:      "dev2026",
-			Name:          "Rahul Verma",
-			Role:          "AI Platform Engineer",
-			TenantID:      "tnt_acme_india",
-			TenantName:    "Acme FinTech India Ltd.",
-			Department:    "AI & MCP Engineering",
-			AllowedScopes: []string{"invoices.read", "repos.pr.create", "mcp.tools.execute"},
-			CreatedAt:     now - 86400*15,
-		},
-	}
+func (ds *DataStore) seedGuardrailTemplates() {
+	ds.state.Users = []*User{}
+	ds.state.Organizations = []*Organization{}
+	ds.state.AuditLogs = []*AuditLogEntry{}
 
 	ds.state.Policies = []*PolicyRule{
 		{
 			ID:          "pol_egress_allowlist",
 			Name:        "Default-Deny Unknown Egress Hosts",
 			Code:        "RULE_DEFAULT_DENY_UNKNOWN_EGRESS",
-			Description: "Blocks any agent HTTP or MCP tool call targeting an external host outside the tenant's verified allowlist (*.acme.local).",
-			CedarExpr:   `forbid (principal, action, resource) unless { resource.host in ["gw.acme.local", "invoices.acme.local", "payments.acme.local", "crm.acme.local"] };`,
+			Description: "Blocks any agent HTTP or MCP tool call targeting an external host outside your organization's verified domain allowlist.",
+			CedarExpr:   `forbid (principal, action, resource) unless { resource.host in context.org_allowed_hosts };`,
 			Action:      "BLOCK_AND_REVOKE",
 			Enabled:     true,
 			Category:    "Egress",
-			HitsCount:   14,
+			HitsCount:   0,
 		},
 		{
 			ID:          "pol_oversight_protect",
 			Name:        "Protect Safety Monitoring & Alerting Configs",
 			Code:        "RULE_PROTECT_OVERSIGHT_CONFIG",
-			Description: "Prevents autonomous coding or ops agents from disabling or modifying security monitoring and alerting pipelines (stops OpenAI GPT-6 monitor-disable incident).",
+			Description: "Prevents autonomous coding or ops agents from disabling or modifying security monitoring and alerting pipelines.",
 			CedarExpr:   `forbid (principal is Agent, action in [Action::"write", Action::"delete"], resource) when { resource.path like "/monitoring/*" || resource.path like "/alerts/*" };`,
 			Action:      "BLOCK_AND_REVOKE",
 			Enabled:     true,
 			Category:    "Oversight",
-			HitsCount:   3,
+			HitsCount:   0,
 		},
 		{
 			ID:          "pol_no_destructive",
 			Name:        "Forbid Autonomous Destructive Deletes",
 			Code:        "RULE_NEVER_DELETE_DESTRUCTIVE",
-			Description: "Hard tenant guardrail preventing any AI agent or sub-agent from executing destructive delete or drop_table operations without human intervention.",
+			Description: "Hard guardrail preventing any AI agent or sub-agent from executing destructive delete or drop_table operations without human intervention.",
 			CedarExpr:   `forbid (principal is Agent, action in [Action::"delete", Action::"drop_table"], resource);`,
 			Action:      "BLOCK_AND_REVOKE",
 			Enabled:     true,
 			Category:    "Oversight",
-			HitsCount:   5,
+			HitsCount:   0,
 		},
 		{
 			ID:          "pol_unissued_cred",
 			Name:        "Block Unissued / Stolen Static Credentials",
 			Code:        "RULE_UNISSUED_CREDENTIAL_BLOCK",
-			Description: "Rejects any outbound request carrying an API key or bearer token that was not dynamically minted for the active attested run (stops CERT-In & LiteLLM key leaks).",
+			Description: "Rejects any outbound request carrying an API key or bearer token that was not dynamically minted for the active attested run.",
 			CedarExpr:   `forbid (principal is Agent, action, resource) when { !context.credential_issued_to_run || !context.dpop_verified };`,
 			Action:      "BLOCK_AND_REVOKE",
 			Enabled:     true,
 			Category:    "Egress",
-			HitsCount:   8,
+			HitsCount:   0,
 		},
 		{
 			ID:          "pol_ciba_financial",
-			Name:        "Require OpenID CIBA Step-Up for Financial Transfers",
+			Name:        "Require OpenID CIBA Step-Up for High-Risk Actions",
 			Code:        "RULE_CIBA_FINANCIAL_STEP_UP",
-			Description: "Holds any payment initiation or money-movement call (score 0.30–0.75) and dispatches an asynchronous OpenID CIBA push notification to the human owner's device.",
-			CedarExpr:   `permit (principal is Agent, action == Action::"payment_transfer", resource) when { context.ciba_human_approved == true && context.data_residency == "IN" };`,
+			Description: "Holds any high-sensitivity mutation or money-movement call (score 0.30–0.75) and dispatches a live approval request to the dashboard.",
+			CedarExpr:   `permit (principal is Agent, action == Action::"payment_transfer", resource) when { context.ciba_human_approved == true };`,
 			Action:      "STEP_UP_CIBA",
 			Enabled:     true,
 			Category:    "Financial",
-			HitsCount:   9,
-		},
-		{
-			ID:          "pol_india_residency",
-			Name:        "CERT-In & RBI India Data Residency Enforcement",
-			Code:        "RULE_INDIA_DATA_RESIDENCY",
-			Description: "Ensures financial and PII payloads tagged with India residency ('IN') cannot be routed to non-Indian endpoints or unverified third-party LLMs.",
-			CedarExpr:   `forbid (principal is Agent, action, resource) when { resource.data_residency == "IN" && context.destination_region != "ap-south-1" };`,
-			Action:      "BLOCK_AND_REVOKE",
-			Enabled:     true,
-			Category:    "Data Residency",
-			HitsCount:   4,
+			HitsCount:   0,
 		},
 	}
 
-	ds.state.GatewayRoutes = []*GatewayRoute{
-		{
-			ID:              "rt_invoices_mcp",
-			Name:            "Q3 Finance Invoices MCP Server",
-			UpstreamHost:    "invoices.acme.local",
-			PathPrefix:      "/finance/invoices/2026-Q3",
-			RequiredScope:   "invoices.read",
-			Sensitivity:     "LOW",
-			DataResidency:   "IN (Mumbai ap-south-1)",
-			RequireDPoP:     true,
-			StepUpThreshold: 0.30,
-			BlockThreshold:  0.75,
-			AllowedActions:  []string{"read", "list", "summarize"},
-		},
-		{
-			ID:              "rt_payments_neft",
-			Name:            "Treasury NEFT / RTGS Payment API",
-			UpstreamHost:    "payments.acme.local",
-			PathPrefix:      "/payments/transfer",
-			RequiredScope:   "payments.transfer",
-			Sensitivity:     "HIGH_FINANCIAL",
-			DataResidency:   "IN (Mumbai ap-south-1)",
-			RequireDPoP:     true,
-			StepUpThreshold: 0.30,
-			BlockThreshold:  0.75,
-			AllowedActions:  []string{"payment_transfer"},
-		},
-		{
-			ID:              "rt_crm_customers",
-			Name:            "Enterprise Customer CRM API",
-			UpstreamHost:    "crm.acme.local",
-			PathPrefix:      "/crm/customers",
-			RequiredScope:   "crm.read",
-			Sensitivity:     "LOW",
-			DataResidency:   "IN (Mumbai ap-south-1)",
-			RequireDPoP:     true,
-			StepUpThreshold: 0.30,
-			BlockThreshold:  0.75,
-			AllowedActions:  []string{"read"},
-		},
-		{
-			ID:              "rt_oversight_config",
-			Name:            "SecOps Monitoring & Alerting Control Plane",
-			UpstreamHost:    "gw.acme.local",
-			PathPrefix:      "/monitoring/alerts",
-			RequiredScope:   "admin.policies",
-			Sensitivity:     "CRITICAL_OVERSIGHT",
-			DataResidency:   "IN (Mumbai ap-south-1)",
-			RequireDPoP:     true,
-			StepUpThreshold: 0.20,
-			BlockThreshold:  0.50,
-			AllowedActions:  []string{"read"},
-		},
-	}
-
-	ds.state.AuditLogs = []*AuditLogEntry{}
+	ds.state.GatewayRoutes = []*GatewayRoute{}
 }
 
-func (ds *DataStore) Authenticate(email, password string) (*User, string, bool) {
+// RegisterUserAndOrg signs up a real user and creates their organization tenant.
+func (ds *DataStore) RegisterUserAndOrg(name, email, password, orgName, orgDomain string) (*User, *Organization, string, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
+
+	email = strings.TrimSpace(strings.ToLower(email))
+	if email == "" || password == "" {
+		return nil, nil, "", fmt.Errorf("email and password are required")
+	}
 	for _, u := range ds.state.Users {
-		if u.Email == email && (u.Password == password || password == "demo") {
+		if strings.EqualFold(u.Email, email) {
+			return nil, nil, "", fmt.Errorf("account with email %s already exists (please sign in)", email)
+		}
+	}
+
+	if orgName == "" {
+		parts := strings.Split(email, "@")
+		orgName = parts[0] + "-org"
+	}
+	slug := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(orgName), " ", "-"))
+	if orgDomain == "" {
+		orgDomain = slug + ".agentidentity.local"
+	}
+
+	now := time.Now().Unix()
+	org := &Organization{
+		ID:          "org_" + randomToken(6),
+		Name:        orgName,
+		Slug:        slug,
+		Domain:      orgDomain,
+		OwnerEmail:  email,
+		DCREnabled:  true,
+		CAMDEnabled: true,
+		CRMEnabled:  true,
+		DPoPEnabled: true,
+		CIBAEnabled: true,
+		CreatedAt:   now,
+	}
+	ds.state.Organizations = append(ds.state.Organizations, org)
+
+	user := &User{
+		ID:            "usr_" + randomToken(6),
+		Email:         email,
+		Password:      password,
+		Name:          name,
+		Role:          "Organization Owner",
+		OrgID:         org.ID,
+		OrgName:       org.Name,
+		OrgDomain:     org.Domain,
+		AllowedScopes: []string{"crm.read", "crm.write", "invoices.read", "payments.transfer", "files.read", "mcp.tools.execute"},
+		CreatedAt:     now,
+	}
+	ds.state.Users = append(ds.state.Users, user)
+	_ = ds.save()
+
+	tok := "sess_" + randomToken(16)
+	copyUser := *user
+	copyUser.Password = ""
+	ds.sessions[tok] = &copyUser
+
+	return &copyUser, org, tok, nil
+}
+
+func (ds *DataStore) Authenticate(email, password string) (*User, *Organization, string, bool) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	email = strings.TrimSpace(strings.ToLower(email))
+	for _, u := range ds.state.Users {
+		if strings.EqualFold(u.Email, email) && u.Password == password {
 			tok := "sess_" + randomToken(16)
 			copyUser := *u
 			copyUser.Password = ""
 			ds.sessions[tok] = &copyUser
-			return &copyUser, tok, true
+			var userOrg *Organization
+			for _, o := range ds.state.Organizations {
+				if o.ID == u.OrgID {
+					co := *o
+					userOrg = &co
+					break
+				}
+			}
+			return &copyUser, userOrg, tok, true
 		}
 	}
-	return nil, "", false
+	return nil, nil, "", false
+}
+
+func (ds *DataStore) GetSession(token string) (*User, *Organization, bool) {
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
+	u, ok := ds.sessions[token]
+	if !ok {
+		return nil, nil, false
+	}
+	var userOrg *Organization
+	for _, o := range ds.state.Organizations {
+		if o.ID == u.OrgID {
+			co := *o
+			userOrg = &co
+			break
+		}
+	}
+	return u, userOrg, true
+}
+
+func (ds *DataStore) CreateOrganization(ownerEmail, orgName, orgDomain string) *Organization {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	slug := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(orgName), " ", "-"))
+	if orgDomain == "" {
+		orgDomain = slug + ".agentidentity.local"
+	}
+	org := &Organization{
+		ID:          "org_" + randomToken(6),
+		Name:        orgName,
+		Slug:        slug,
+		Domain:      orgDomain,
+		OwnerEmail:  ownerEmail,
+		DCREnabled:  true,
+		CAMDEnabled: true,
+		CRMEnabled:  true,
+		DPoPEnabled: true,
+		CIBAEnabled: true,
+		CreatedAt:   time.Now().Unix(),
+	}
+	ds.state.Organizations = append(ds.state.Organizations, org)
+	_ = ds.save()
+	c := *org
+	return &c
+}
+
+func (ds *DataStore) ListOrganizations(ownerEmail string) []*Organization {
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
+	out := make([]*Organization, 0)
+	for _, o := range ds.state.Organizations {
+		if ownerEmail == "" || strings.EqualFold(o.OwnerEmail, ownerEmail) {
+			c := *o
+			out = append(out, &c)
+		}
+	}
+	return out
+}
+
+func (ds *DataStore) UpdateOrgFlows(orgID string, dcr, camd, crm, dpop, ciba bool) (*Organization, bool) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	for _, o := range ds.state.Organizations {
+		if o.ID == orgID || o.Slug == orgID {
+			o.DCREnabled = dcr
+			o.CAMDEnabled = camd
+			o.CRMEnabled = crm
+			o.DPoPEnabled = dpop
+			o.CIBAEnabled = ciba
+			_ = ds.save()
+			c := *o
+			return &c, true
+		}
+	}
+	return nil, false
+}
+
+func (ds *DataStore) ResetAllData() {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	ds.seedGuardrailTemplates()
+	_ = ds.save()
+}
+
+func (ds *DataStore) ClearOrgActivity(orgID string) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	ds.state.AuditLogs = []*AuditLogEntry{}
+	for _, p := range ds.state.Policies {
+		p.HitsCount = 0
+	}
+	_ = ds.save()
 }
 
 func (ds *DataStore) ListUsers() []*User {
@@ -383,7 +465,6 @@ func (ds *DataStore) AppendAuditLog(entry AuditLogEntry) AuditLogEntry {
 	if entry.Timestamp == "" {
 		entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	}
-	// Prepend newest first
 	ds.state.AuditLogs = append([]*AuditLogEntry{&entry}, ds.state.AuditLogs...)
 	if len(ds.state.AuditLogs) > 300 {
 		ds.state.AuditLogs = ds.state.AuditLogs[:300]
