@@ -140,8 +140,9 @@ gc run deploy agentid-console --image "$IMG/console:$TAG" --region "$REGION" --a
 
 say "Checking service URLs"
 for s in agentid-api agentid-gateway agentid-console; do
-  actual="$(gc run services describe "$s" --region "$REGION" --format 'value(status.url)')"
-  [ "$actual" = "$(url_of "$s")" ] || echo "WARNING: $s is served at $actual, expected $(url_of "$s"); update the URLs in this script."
+  # A service answers on several URLs (legacy hashed + deterministic); ours must be among them.
+  urls="$(gc run services describe "$s" --region "$REGION" --format 'value(metadata.annotations."run.googleapis.com/urls")')"
+  case "$urls" in *"$(url_of "$s")"*) ;; *) echo "WARNING: $s does not answer on $(url_of "$s") (has: $urls)";; esac
 done
 curl -fsS "$API_URL/health" && echo
 curl -fsS "$GW_URL/gateway/status" | head -c 400 && echo
