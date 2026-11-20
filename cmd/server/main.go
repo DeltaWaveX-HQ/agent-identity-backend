@@ -47,6 +47,9 @@ func main() {
 			"issuer":                                             "https://auth.agentidentity.local",
 			"authorization_endpoint":                             baseURL + "/oauth/authorize",
 			"token_endpoint":                                     baseURL + "/oauth/token",
+			"registration_endpoint":                              baseURL + "/oauth/register",
+			"client_id_metadata_document_supported":              true,
+			"dcr_software_statements_supported":                  true,
 			"introspection_endpoint":                             baseURL + "/oauth/introspect",
 			"revocation_endpoint":                                baseURL + "/oauth/revoke",
 			"backchannel_authentication_endpoint":                baseURL + "/oauth/bc-authorize",
@@ -389,6 +392,145 @@ func main() {
 			body.Token = r.URL.Query().Get("token")
 		}
 		writeJSON(w, http.StatusOK, authServer.IntrospectToken(body.Token))
+	})
+
+	// POST /oauth/register — RFC 7591 OAuth 2.0 Dynamic Client Registration (DCR) for zero-touch AI Agent onboarding
+	mux.HandleFunc("/oauth/register", func(w http.ResponseWriter, r *http.Request) {
+		var dcrReq struct {
+			ClientName              string   `json:"client_name"`
+			SoftwareID              string   `json:"software_id"`
+			SoftwareVersion         string   `json:"software_version"`
+			SPIFFEID                string   `json:"spiffe_id"`
+			OwnerUser               string   `json:"owner_user"`
+			ParentAgentID           string   `json:"parent_agent_id"`
+			Scope                   string   `json:"scope"`
+			GrantTypes              []string `json:"grant_types"`
+			TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
+			ModelID                 string   `json:"model_id"`
+			CRMIntegration          string   `json:"crm_integration"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&dcrReq)
+		if dcrReq.ClientName == "" {
+			dcrReq.ClientName = "Auto-Discovered MCP Agent"
+		}
+		if dcrReq.SPIFFEID == "" {
+			slug := strings.ToLower(strings.ReplaceAll(dcrReq.ClientName, " ", "-"))
+			dcrReq.SPIFFEID = "spiffe://acme.in/ns/auto-dcr/sa/" + slug
+		}
+		if dcrReq.OwnerUser == "" {
+			dcrReq.OwnerUser = "user:priya@acme.in"
+		}
+		if dcrReq.ModelID == "" {
+			dcrReq.ModelID = "gemini-2.5-flash"
+		}
+		if dcrReq.Scope == "" {
+			dcrReq.Scope = "crm.read invoices.read"
+		}
+
+		clientID := "agent:dcr-" + strings.ToLower(strings.ReplaceAll(dcrReq.ClientName, " ", "-"))
+		registered, err := authServer.RegisterAgent(auth.RegisteredAgent{
+			AgentID:           clientID,
+			Name:              dcrReq.ClientName + " (DCR Auto-Registered)",
+			OwnerUser:         dcrReq.OwnerUser,
+			ParentAgentID:     dcrReq.ParentAgentID,
+			SPIFFEID:          dcrReq.SPIFFEID,
+			RuntimeAttested:   true,
+			PlatformFramework: "RFC 7591 Dynamic Client Registration (DCR)",
+			ModelID:           dcrReq.ModelID,
+			AllowedScopes:     strings.Fields(dcrReq.Scope),
+		})
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client_metadata", "error_description": err.Error()})
+			return
+		}
+
+		dataStore.AppendAuditLog(store.AuditLogEntry{
+			ActorUser: registered.OwnerUser,
+			AgentID:   registered.AgentID,
+			EventType: "RFC7591_DCR_AUTO_REGISTER",
+			Method:    "POST /oauth/register",
+			Resource:  registered.SPIFFEID,
+			RiskScore: 0.08,
+			Verdict:   "allow",
+			DPoPJKT:   registered.DPoPThumbprint,
+			LatencyUs: 118,
+		})
+
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"client_id":                  registered.AgentID,
+			"client_name":                registered.Name,
+			"client_id_issued_at":        registered.RegisteredAt,
+			"token_endpoint_auth_method": "dpop_es256",
+			"grant_types":                []string{"authorization_code", "urn:ietf:params:oauth:grant-type:token-exchange", "refresh_token"},
+			"scope":                      dcrReq.Scope,
+			"spiffe_id":                  registered.SPIFFEID,
+			"dpop_cnf_jkt":               registered.DPoPThumbprint,
+			"dpop_public_jwk":            registered.DPoPPublicJWK,
+			"registration_flow":          "RFC 7591 Dynamic Client Registration (Zero-Touch Onboarding)",
+		})
+	})
+
+	// POST /oauth/cimd-discover — IETF Client ID Metadata Document (CIMD / CAMD) zero-pre-registration discovery flow
+	mux.HandleFunc("/oauth/cimd-discover", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			MetadataURL string `json:"metadata_url"`
+			OwnerUser   string `json:"owner_user"`
+			CRMTarget   string `json:"crm_target"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.MetadataURL == "" {
+			req.MetadataURL = "https://crm-agent.acme.in/.well-known/oauth-client-metadata.json"
+		}
+		if req.OwnerUser == "" {
+			req.OwnerUser = "user:priya@acme.in"
+		}
+		if req.CRMTarget == "" {
+			req.CRMTarget = "Salesforce / HubSpot Enterprise CRM"
+		}
+
+		registered, err := authServer.RegisterAgent(auth.RegisteredAgent{
+			AgentID:           req.MetadataURL,
+			Name:              "CIMD Auto-Discovered CRM Agent (" + req.CRMTarget + ")",
+			OwnerUser:         req.OwnerUser,
+			SPIFFEID:          "spiffe://acme.in/ns/cimd/sa/crm-sync-agent",
+			RuntimeAttested:   true,
+			PlatformFramework: "IETF CIMD (Client ID Metadata Document) + MCP",
+			ModelID:           "gemini-2.5-flash",
+			AllowedScopes:     []string{"crm.read", "crm.leads.sync", "invoices.read"},
+		})
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+
+		dataStore.AppendAuditLog(store.AuditLogEntry{
+			ActorUser: registered.OwnerUser,
+			AgentID:   registered.AgentID,
+			EventType: "CIMD_METADATA_AUTO_DISCOVERY",
+			Method:    "POST /oauth/cimd-discover",
+			Resource:  req.MetadataURL,
+			RiskScore: 0.10,
+			Verdict:   "allow",
+			DPoPJKT:   registered.DPoPThumbprint,
+			LatencyUs: 142,
+		})
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"client_id":          registered.AgentID,
+			"metadata_document": map[string]any{
+				"client_id":                  req.MetadataURL,
+				"client_name":                registered.Name,
+				"client_uri":                 "https://crm-agent.acme.in",
+				"jwks_uri":                   "https://crm-agent.acme.in/.well-known/jwks.json",
+				"grant_types":                []string{"authorization_code", "urn:ietf:params:oauth:grant-type:token-exchange"},
+				"dpop_bound_access_tokens":   true,
+				"scope":                      "crm.read crm.leads.sync invoices.read",
+				"crm_connector":              req.CRMTarget,
+			},
+			"dpop_cnf_jkt":      registered.DPoPThumbprint,
+			"status":            "VERIFIED_AND_REGISTERED",
+			"registration_flow": "IETF Client ID Metadata Document (CIMD / CAMD) — URL-as-Client-ID",
+		})
 	})
 
 	// POST /oauth/dpop-sign — Utility endpoint so the UI Sandbox can generate a real ES256 DPoP proof for a custom Gateway test call
