@@ -14,13 +14,16 @@ func raw(v any) json.RawMessage {
 }
 
 func (ds *DataStore) Kinds() []string {
-	return []string{"user", "org", "policy", "route", "audit", "session"}
+	return []string{"user", "org", "policy", "route", "audit", "session", "hook_key"}
 }
 
 func (ds *DataStore) Snapshot() persist.Snapshot {
 	ds.mu.RLock()
 	defer ds.mu.RUnlock()
-	out := persist.Snapshot{"user": {}, "org": {}, "policy": {}, "route": {}, "audit": {}, "session": {}}
+	out := persist.Snapshot{"user": {}, "org": {}, "policy": {}, "route": {}, "audit": {}, "session": {}, "hook_key": {}}
+	for h, k := range ds.hookKeys {
+		out["hook_key"][h] = raw(k) // id is the key's hash; the key itself is never stored
+	}
 	for _, u := range ds.state.Users {
 		out["user"][u.ID] = raw(u) // password field holds a bcrypt hash
 	}
@@ -76,6 +79,10 @@ func (ds *DataStore) Restore(l persist.Loaded) error {
 	if err != nil {
 		return err
 	}
+	hookKeys, err := persist.Decode[HookKey](l["hook_key"])
+	if err != nil {
+		return err
+	}
 
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
@@ -107,6 +114,7 @@ func (ds *DataStore) Restore(l persist.Loaded) error {
 	}
 	ds.state.AuditLogs = logs
 	ds.sessions = sessions
+	ds.hookKeys = hookKeys
 	return nil
 }
 

@@ -11,8 +11,15 @@ package main
 // Matching is by tool + canonical arguments, oldest first. Notices for the main agent (no agent_id)
 // are kept too, so identical calls from parent and sub-agent are not confused.
 // Attribution can only narrow access (a sub-agent gets a subset of its parent), never widen it.
+//
+// Two ways in:
+//   - from this machine (loopback): the hook of a locally running gateway, no key needed;
+//   - from anywhere, with a personal hook key (Authorization: Bearer ahk_…) issued in the console.
+//     The notice then belongs to the key's user and only matches that user's own MCP sessions,
+//     so nobody can relabel another user's calls.
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -26,6 +33,7 @@ import (
 const attributionTTL = 10 * time.Minute // the user may sit on Claude's own permission prompt
 
 type attribution struct {
+	owner     string // user the notice belongs to ("user:email"); "" = local hook, any user
 	key       string
 	agentID   string
 	agentType string
@@ -65,13 +73,14 @@ func (b *attributionBook) add(a attribution) {
 	b.pending = append(kept, a)
 }
 
-// take removes and returns the oldest notice for this exact call.
-func (b *attributionBook) take(key string) (attribution, bool) {
+// take removes and returns the oldest notice for this exact call by this user.
+func (b *attributionBook) take(key, user string) (attribution, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := time.Now()
+	user = strings.ToLower(user)
 	for i, p := range b.pending {
-		if p.key == key && now.Sub(p.at) < attributionTTL {
+		if p.key == key && (p.owner == "" || p.owner == user) && now.Sub(p.at) < attributionTTL {
 			b.pending = append(b.pending[:i], b.pending[i+1:]...)
 			return p, true
 		}
@@ -94,10 +103,15 @@ func (g *Gateway) handleAttribution(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST hook input", http.StatusMethodNotAllowed)
 		return
 	}
-	// Local-only for the prototype: the hook runs on the same machine as the gateway.
+	owner := ""
 	if !isLoopback(r) {
-		http.Error(w, "attribution is accepted from this machine only", http.StatusForbidden)
-		return
+		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		user, ok := g.hookKeyUser(r.Context(), key)
+		if !ok {
+			http.Error(w, "a hook key is required (create one in the console: Connect & tools)", http.StatusUnauthorized)
+			return
+		}
+		owner = user
 	}
 	var in struct {
 		ToolName  string          `json:"tool_name"`
@@ -120,9 +134,47 @@ func (g *Gateway) handleAttribution(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent) // not one of ours
 		return
 	}
-	g.attrib.add(attribution{key: exposed + "|" + canonicalArgs(in.ToolInput), agentID: in.AgentID, agentType: in.AgentType, at: time.Now()})
+	g.attrib.add(attribution{owner: owner, key: exposed + "|" + canonicalArgs(in.ToolInput), agentID: in.AgentID, agentType: in.AgentType, at: time.Now()})
 	if in.AgentID != "" {
 		log.Printf("attribute %-28s sub-agent %s (%s)", exposed, in.AgentType, in.AgentID)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+type hookKeyEntry struct {
+	user    string
+	ok      bool
+	expires time.Time
+}
+
+// hookKeyUser verifies a hook key with the authorization server (cached for a minute).
+func (g *Gateway) hookKeyUser(ctx context.Context, key string) (string, bool) {
+	if !strings.HasPrefix(key, "ahk_") {
+		return "", false
+	}
+	g.hookMu.Lock()
+	if e, ok := g.hookCache[key]; ok && time.Now().Before(e.expires) {
+		g.hookMu.Unlock()
+		return e.user, e.ok
+	}
+	g.hookMu.Unlock()
+	var out struct {
+		Active  bool   `json:"active"`
+		UserSub string `json:"user_sub"`
+	}
+	if err := g.postAuth(ctx, "/api/v1/gateway/hook-key/verify", map[string]string{"key": key}, &out); err != nil {
+		log.Printf("hook key check failed: %v", err)
+		return "", false
+	}
+	e := hookKeyEntry{user: strings.ToLower(out.UserSub), ok: out.Active && out.UserSub != "", expires: time.Now().Add(time.Minute)}
+	g.hookMu.Lock()
+	if g.hookCache == nil {
+		g.hookCache = map[string]hookKeyEntry{}
+	}
+	if len(g.hookCache) > 1000 {
+		g.hookCache = map[string]hookKeyEntry{}
+	}
+	g.hookCache[key] = e
+	g.hookMu.Unlock()
+	return e.user, e.ok
 }

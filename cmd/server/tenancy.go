@@ -90,6 +90,7 @@ var tenantPaths = map[string]bool{
 	"/api/v1/console/grants":           true,
 	"/api/v1/console/approvals":        true,
 	"/api/v1/console/connections":      true,
+	"/api/v1/console/hook-key":         true,
 	"/api/v1/audit-logs":               true,
 	"/api/v1/ciba":                     true,
 	"/api/v1/oauth/ciba-resolve":       true,

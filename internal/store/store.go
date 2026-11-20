@@ -104,6 +104,7 @@ type DataStore struct {
 	filePath string
 	state    PersistedState
 	sessions map[string]*Session // sessionToken -> session
+	hookKeys map[string]*HookKey // sha256(key) -> key metadata
 }
 
 // SessionTTL is how long a console sign-in stays valid.

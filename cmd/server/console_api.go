@@ -66,6 +66,48 @@ func registerConsoleAPI(mux *http.ServeMux, d *serverDeps) {
 	mux.HandleFunc("/api/v1/console/grants", d.consoleGrants)
 	mux.HandleFunc("/api/v1/console/approvals", d.consoleApprovals)
 	mux.HandleFunc("/api/v1/console/connections", d.consoleConnections)
+	mux.HandleFunc("/api/v1/console/hook-key", d.consoleHookKey)
+	mux.HandleFunc("/api/v1/gateway/hook-key/verify", d.gatewayVerifyHookKey)
+}
+
+// consoleHookKey: GET shows whether the signed-in user has a sub-agent hook key; POST issues a
+// new one (revoking the old) and returns it once, with the Claude Code hook ready to paste.
+func (d *serverDeps) consoleHookKey(w http.ResponseWriter, r *http.Request) {
+	u := sessionUser(r)
+	if u == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "sign_in_required"})
+		return
+	}
+	gw := os.Getenv("GATEWAY_URL")
+	if gw == "" {
+		gw = strings.TrimSuffix(d.mcpResource, "/mcp")
+	}
+	if r.Method == http.MethodPost {
+		key, hk := d.dataStore.IssueHookKey(u.ID)
+		writeJSON(w, http.StatusOK, map[string]any{"key": key, "prefix": hk.Prefix, "created_at": hk.CreatedAt, "attribution_url": gw + "/gateway/attribution"})
+		return
+	}
+	hk, ok := d.dataStore.HookKeyFor(u.ID)
+	out := map[string]any{"exists": ok, "attribution_url": gw + "/gateway/attribution"}
+	if ok {
+		out["prefix"], out["created_at"] = hk.Prefix, hk.CreatedAt
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// gatewayVerifyHookKey (gateway only) resolves a hook key to its user, so the gateway can accept a
+// sub-agent notice only for that user's own MCP sessions.
+func (d *serverDeps) gatewayVerifyHookKey(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Key string `json:"key"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	u, ok := d.dataStore.HookKeyUser(body.Key)
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]any{"active": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"active": true, "user_sub": "user:" + strings.ToLower(u.Email)})
 }
 
 func (d *serverDeps) grantViews(t *tenant) []grantView {

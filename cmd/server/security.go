@@ -29,9 +29,10 @@ const (
 )
 
 var gatewayOnly = map[string]bool{
-	"/api/v1/gateway/mcp/decide": true,
-	"/api/v1/gateway/mcp/report": true,
-	"/oauth/introspect":          true, // RFC 7662 requires the caller (a resource server) to authenticate
+	"/api/v1/gateway/mcp/decide":      true,
+	"/api/v1/gateway/mcp/report":      true,
+	"/api/v1/gateway/hook-key/verify": true,
+	"/oauth/introspect":               true, // RFC 7662 requires the caller (a resource server) to authenticate
 }
 
 var publicAPI = map[string]bool{

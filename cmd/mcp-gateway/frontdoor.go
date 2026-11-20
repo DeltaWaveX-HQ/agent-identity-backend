@@ -77,7 +77,9 @@ type Gateway struct {
 	sessMu   sync.Mutex
 	sessions map[string]*mcpSession
 
-	attrib attributionBook
+	attrib    attributionBook
+	hookMu    sync.Mutex
+	hookCache map[string]hookKeyEntry
 }
 
 var (
@@ -614,7 +616,7 @@ func (g *Gateway) callTool(ctx context.Context, tok string, info *tokenInfo, sid
 	//  2. a client adapter notice (e.g. Claude Code's PreToolUse hook) matched to this exact call
 	// (A sub-agent holding its own exchanged token needs neither: its token says who it is.)
 	var subAgent map[string]string
-	hookNotice, hasNotice := g.attrib.take(p.Name + "|" + canonicalArgs(p.Arguments))
+	hookNotice, hasNotice := g.attrib.take(p.Name+"|"+canonicalArgs(p.Arguments), info.Sub)
 	if tag, ok := p.Meta[subAgentMetaKey].(map[string]any); ok {
 		subAgent = map[string]string{"source": "mcp_meta"}
 		for _, k := range []string{"name", "type", "id"} {
