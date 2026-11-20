@@ -1,0 +1,37 @@
+# Continuous deployment (Cloud Build trigger on push). Builds the backend image and rolls both
+# backend services onto it. Only the image changes: secrets, env vars, Cloud SQL and scaling set
+# by deploy/gcp.sh stay as they are. First-time setup is deploy/gcp.sh + deploy/setup-cd.sh.
+substitutions:
+  _REGION: asia-south1
+  _REPO: agentid
+options:
+  logging: CLOUD_LOGGING_ONLY
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/backend:$SHORT_SHA", "."]
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ["push", "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/backend:$SHORT_SHA"]
+  - id: deploy-api
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args: ["run", "deploy", "agentid-api", "--image", "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/backend:$SHORT_SHA", "--region", "${_REGION}", "--quiet"]
+  - id: deploy-gateway
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args: ["run", "deploy", "agentid-gateway", "--image", "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/backend:$SHORT_SHA", "--region", "${_REGION}", "--quiet"]
+  - id: smoke-test
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        api=$$(gcloud run services describe agentid-api --region ${_REGION} --format 'value(status.url)')
+        gw=$$(gcloud run services describe agentid-gateway --region ${_REGION} --format 'value(status.url)')
+        curl -fsS "$$api/health" | grep -q '"database":"ok"'
+        curl -fsS "$$gw/gateway/status" | grep -q '"resource"'
+        test "$$(curl -s -o /dev/null -w '%{http_code}' -X POST "$$gw/mcp" -d '{}')" = 401
+        echo "smoke test passed"
+images: ["${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/backend:$SHORT_SHA"]
