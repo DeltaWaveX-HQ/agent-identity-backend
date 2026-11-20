@@ -337,11 +337,14 @@ func (s *Server) ExchangeAuthCodeForTokens(code, pkceVerifier, dpopJKT string, i
 		},
 	}
 
+	tokenClaims.IdentityHierarchy = crypto.BuildUserAgentHierarchy(tokenClaims, "", "gemini-2.5-flash", "yes", []string{"spiffe_workload_attested", "rar_scope_matches_task", "dpop_sender_constrained"})
+
 	priv, kid := s.km.ActiveSigner()
 	jwtStr, err := crypto.SignAccessToken(priv, kid, tokenClaims)
 	if err != nil {
 		return "", nil, "", err
 	}
+	tokenClaims.IdentityHierarchy = crypto.BuildUserAgentHierarchy(tokenClaims, jwtStr, "gemini-2.5-flash", "yes", []string{"spiffe_workload_attested", "rar_scope_matches_task", "dpop_sender_constrained"})
 
 	s.dag.RegisterToken(&TokenNode{
 		JTI:       jti,
@@ -411,11 +414,14 @@ func (s *Server) ExchangeSubAgentToken(parentClaims *crypto.AgentAccessTokenClai
 		},
 	}
 
+	subClaims.IdentityHierarchy = crypto.BuildUserAgentHierarchy(subClaims, "", "gemini-2.5-flash", "yes", []string{"rfc8693_attenuated_from_parent", "ttl_shrunk_5m_to_3m", "distinct_sub_agent_dpop_key"})
+
 	priv, kid := s.km.ActiveSigner()
 	jwtStr, err := crypto.SignAccessToken(priv, kid, subClaims)
 	if err != nil {
 		return "", nil, err
 	}
+	subClaims.IdentityHierarchy = crypto.BuildUserAgentHierarchy(subClaims, jwtStr, "gemini-2.5-flash", "yes", []string{"rfc8693_attenuated_from_parent", "ttl_shrunk_5m_to_3m", "distinct_sub_agent_dpop_key"})
 
 	s.dag.RegisterToken(&TokenNode{
 		JTI:       subJTI,
