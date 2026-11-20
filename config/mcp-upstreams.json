@@ -2,18 +2,39 @@
   "listen": ":8090",
   "public_url": "http://localhost:8090",
   "auth_server": "http://localhost:8080",
-  "egress_allowlist": ["webhook.site", "example.com", "api.github.com", "raw.githubusercontent.com", "docs.anthropic.com"],
+  "egress_allowlist": [
+    "webhook.site",
+    "example.com",
+    "api.github.com",
+    "raw.githubusercontent.com",
+    "docs.anthropic.com"
+  ],
   "upstreams": [
     {
       "name": "bank",
       "description": "Demo core-banking API (local, stateful: balances and payments persist)",
       "transport": "stdio",
       "command": "go",
-      "args": ["run", "./cmd/demo-bank-mcp", "-state", "demo-data/bank_state.json"],
+      "args": [
+        "run",
+        "./cmd/demo-bank-mcp",
+        "-state",
+        "demo-data/bank_state.json"
+      ],
       "tools": {
-        "initiate_payment": { "action": "payment_transfer", "amount_arg": "amount_inr" },
-        "export_statement": { "action": "export", "url_args": ["destination_url"] },
-        "delete_payee": { "action": "delete" }
+        "initiate_payment": {
+          "action": "payment_transfer",
+          "amount_arg": "amount_inr"
+        },
+        "export_statement": {
+          "action": "export",
+          "url_args": [
+            "destination_url"
+          ]
+        },
+        "delete_payee": {
+          "action": "delete"
+        }
       }
     },
     {
@@ -21,24 +42,39 @@
       "description": "Finance shared drive (official MCP filesystem server)",
       "transport": "stdio",
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "./demo-data/finance"]
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "./demo-data/finance"
+      ]
     },
     {
       "name": "web",
       "description": "Internet fetch (official MCP fetch server); its output is untrusted",
       "transport": "stdio",
       "command": "uvx",
-      "args": ["mcp-server-fetch"],
+      "args": [
+        "mcp-server-fetch"
+      ],
       "untrusted_output": true,
-      "tools": { "fetch": { "action": "read", "url_args": ["url"] } }
+      "tools": {
+        "fetch": {
+          "action": "read",
+          "url_args": [
+            "url"
+          ]
+        }
+      }
     },
     {
       "name": "github",
-      "enabled": false,
-      "description": "GitHub's remote MCP server (set GITHUB_TOKEN, then enable)",
+      "description": "GitHub's official remote MCP server (on when GITHUB_TOKEN is set)",
       "transport": "http",
       "url": "https://api.githubcopilot.com/mcp/",
-      "headers": { "Authorization": "Bearer ${GITHUB_TOKEN}" }
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      },
+      "enabled_if_env": "GITHUB_TOKEN"
     }
   ]
 }

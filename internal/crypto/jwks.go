@@ -38,6 +38,8 @@ type KeyManager struct {
 	stagedKid  string
 	rotatedAt  time.Time
 	nextRotate time.Time
+	// sealedCache holds the encrypted form of each key by kid (see KeyStore.Snapshot).
+	sealedCache map[string]json.RawMessage
 }
 
 func NewKeyManager() (*KeyManager, error) {

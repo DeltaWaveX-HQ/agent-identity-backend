@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 type User struct {
@@ -71,6 +73,7 @@ type AuditLogEntry struct {
 	TokenJTI    string   `json:"token_jti,omitempty"`
 	FamilyID    string   `json:"family_id,omitempty"`
 	LatencyUs   int64    `json:"latency_us"`
+	Seq         int64    `json:"seq,omitempty"` // monotonic order (newest = largest), survives reloads
 }
 
 type GatewayRoute struct {
@@ -100,14 +103,62 @@ type DataStore struct {
 	mu       sync.RWMutex
 	filePath string
 	state    PersistedState
-	sessions map[string]*User // sessionToken -> User
+	sessions map[string]*Session // sessionToken -> session
+}
+
+// SessionTTL is how long a console sign-in stays valid.
+const SessionTTL = 7 * 24 * time.Hour
+
+type Session struct {
+	UserID    string `json:"user_id"`
+	CreatedAt int64  `json:"created_at"`
+	ExpiresAt int64  `json:"expires_at"`
+}
+
+// hashPassword stores passwords with bcrypt; never in plain text.
+func hashPassword(pw string) string {
+	h, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
+	if err != nil {
+		return ""
+	}
+	return string(h)
+}
+
+// checkPassword verifies a password. Accounts created before hashing (plain-text value) still
+// sign in once; the caller then upgrades them to a hash.
+func checkPassword(stored, pw string) (ok, needsUpgrade bool) {
+	if strings.HasPrefix(stored, "$2") {
+		return bcrypt.CompareHashAndPassword([]byte(stored), []byte(pw)) == nil, false
+	}
+	return stored != "" && stored == pw, true
+}
+
+func (ds *DataStore) newSessionLocked(userID string) string {
+	tok := "sess_" + randomToken(24)
+	now := time.Now()
+	ds.sessions[tok] = &Session{UserID: userID, CreatedAt: now.Unix(), ExpiresAt: now.Add(SessionTTL).Unix()}
+	return tok
+}
+
+// Logout ends a console session.
+func (ds *DataStore) Logout(token string) {
+	ds.mu.Lock()
+	delete(ds.sessions, token)
+	ds.mu.Unlock()
+}
+
+// DetachFile stops writing the local JSON file; state is then persisted by the database syncer.
+func (ds *DataStore) DetachFile() {
+	ds.mu.Lock()
+	ds.filePath = ""
+	ds.mu.Unlock()
 }
 
 func NewDataStore(dataDir string) *DataStore {
 	fp := filepath.Join(dataDir, "idp_tenant_state.json")
 	ds := &DataStore{
 		filePath: fp,
-		sessions: make(map[string]*User),
+		sessions: make(map[string]*Session),
 	}
 	if err := ds.load(); err != nil {
 		ds.seedGuardrailTemplates()
@@ -191,6 +242,9 @@ func (ds *DataStore) RegisterUserAndOrg(name, email, password, orgName, orgDomai
 	if email == "" || password == "" {
 		return nil, nil, "", fmt.Errorf("email and password are required")
 	}
+	if len(password) < 8 {
+		return nil, nil, "", fmt.Errorf("password must be at least 8 characters")
+	}
 	for _, u := range ds.state.Users {
 		if strings.EqualFold(u.Email, email) {
 			return nil, nil, "", fmt.Errorf("account with email %s already exists (please sign in)", email)
@@ -225,7 +279,7 @@ func (ds *DataStore) RegisterUserAndOrg(name, email, password, orgName, orgDomai
 	user := &User{
 		ID:            "usr_" + randomToken(6),
 		Email:         email,
-		Password:      password,
+		Password:      hashPassword(password),
 		Name:          name,
 		Role:          "Organization Owner",
 		OrgID:         org.ID,
@@ -237,11 +291,9 @@ func (ds *DataStore) RegisterUserAndOrg(name, email, password, orgName, orgDomai
 	ds.state.Users = append(ds.state.Users, user)
 	_ = ds.save()
 
-	tok := "sess_" + randomToken(16)
+	tok := ds.newSessionLocked(user.ID)
 	copyUser := *user
 	copyUser.Password = ""
-	ds.sessions[tok] = &copyUser
-
 	return &copyUser, org, tok, nil
 }
 
@@ -250,11 +302,17 @@ func (ds *DataStore) Authenticate(email, password string) (*User, *Organization,
 	defer ds.mu.Unlock()
 	email = strings.TrimSpace(strings.ToLower(email))
 	for _, u := range ds.state.Users {
-		if strings.EqualFold(u.Email, email) && u.Password == password {
-			tok := "sess_" + randomToken(16)
+		if !strings.EqualFold(u.Email, email) {
+			continue
+		}
+		if ok, upgrade := checkPassword(u.Password, password); ok {
+			if upgrade {
+				u.Password = hashPassword(password)
+				_ = ds.save()
+			}
+			tok := ds.newSessionLocked(u.ID)
 			copyUser := *u
 			copyUser.Password = ""
-			ds.sessions[tok] = &copyUser
 			var userOrg *Organization
 			for _, o := range ds.state.Organizations {
 				if o.ID == u.OrgID {
@@ -272,8 +330,20 @@ func (ds *DataStore) Authenticate(email, password string) (*User, *Organization,
 func (ds *DataStore) GetSession(token string) (*User, *Organization, bool) {
 	ds.mu.RLock()
 	defer ds.mu.RUnlock()
-	u, ok := ds.sessions[token]
-	if !ok {
+	sess, ok := ds.sessions[token]
+	if !ok || sess.ExpiresAt < time.Now().Unix() {
+		return nil, nil, false
+	}
+	var u *User
+	for _, x := range ds.state.Users {
+		if x.ID == sess.UserID {
+			c := *x
+			c.Password = ""
+			u = &c
+			break
+		}
+	}
+	if u == nil {
 		return nil, nil, false
 	}
 	var userOrg *Organization
@@ -465,6 +535,7 @@ func (ds *DataStore) AppendAuditLog(entry AuditLogEntry) AuditLogEntry {
 	if entry.Timestamp == "" {
 		entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	}
+	entry.Seq = time.Now().UnixNano()
 	ds.state.AuditLogs = append([]*AuditLogEntry{&entry}, ds.state.AuditLogs...)
 	if len(ds.state.AuditLogs) > 2000 {
 		ds.state.AuditLogs = ds.state.AuditLogs[:2000]
@@ -490,6 +561,9 @@ func (ds *DataStore) load() error {
 }
 
 func (ds *DataStore) save() error {
+	if ds.filePath == "" {
+		return nil // persisted by the database syncer
+	}
 	raw, err := json.MarshalIndent(ds.state, "", "  ")
 	if err != nil {
 		return err

@@ -10,44 +10,44 @@ import (
 
 // TelemetryEvent represents a live event pushed to the Next.js Command Center via SSE.
 type TelemetryEvent struct {
-	ID            string         `json:"id"`
-	Timestamp     string         `json:"timestamp"`
-	StepNumber    int            `json:"step_number,omitempty"`
-	FromLane      string         `json:"from_lane"` // user | agent | as | risk | gw | res
-	ToLane        string         `json:"to_lane"`
-	Label         string         `json:"label"`
-	Who           string         `json:"who"`
-	Headline      string         `json:"headline"`
-	PlainText     string         `json:"plain_text"`
-	UnderTheHood  string         `json:"under_the_hood"`
-	FlowNode      string         `json:"flow_node"` // start | attest | score1 | consent | code | token | exchange | call | runtime | allow | revoke | refresh | end
-	Status        string         `json:"status"`    // info | ok | warn | bad
-	StatusText    string         `json:"status_text"`
-	LatencyUs     int64          `json:"latency_us,omitempty"`
-	TokenRaw      string         `json:"token_raw,omitempty"`
-	TokenClaims   any            `json:"token_claims,omitempty"`
-	DPoPRaw       string         `json:"dpop_raw,omitempty"`
-	DPoPClaims    any            `json:"dpop_claims,omitempty"`
-	RiskDecision  any            `json:"risk_decision,omitempty"`
-	FamilyGraph   any            `json:"family_graph,omitempty"`
-	PhonePrompt   *PhonePrompt   `json:"phone_prompt,omitempty"`
+	ID           string       `json:"id"`
+	Timestamp    string       `json:"timestamp"`
+	StepNumber   int          `json:"step_number,omitempty"`
+	FromLane     string       `json:"from_lane"` // user | agent | as | risk | gw | res
+	ToLane       string       `json:"to_lane"`
+	Label        string       `json:"label"`
+	Who          string       `json:"who"`
+	Headline     string       `json:"headline"`
+	PlainText    string       `json:"plain_text"`
+	UnderTheHood string       `json:"under_the_hood"`
+	FlowNode     string       `json:"flow_node"` // start | attest | score1 | consent | code | token | exchange | call | runtime | allow | revoke | refresh | end
+	Status       string       `json:"status"`    // info | ok | warn | bad
+	StatusText   string       `json:"status_text"`
+	LatencyUs    int64        `json:"latency_us,omitempty"`
+	TokenRaw     string       `json:"token_raw,omitempty"`
+	TokenClaims  any          `json:"token_claims,omitempty"`
+	DPoPRaw      string       `json:"dpop_raw,omitempty"`
+	DPoPClaims   any          `json:"dpop_claims,omitempty"`
+	RiskDecision any          `json:"risk_decision,omitempty"`
+	FamilyGraph  any          `json:"family_graph,omitempty"`
+	PhonePrompt  *PhonePrompt `json:"phone_prompt,omitempty"`
 }
 
 // PhonePrompt triggers the interactive Smartphone Simulator in Next.js (RAR Consent or OpenID CIBA Step-Up).
 type PhonePrompt struct {
-	PromptID             string `json:"prompt_id"`
-	Type                 string `json:"type"` // "rar_consent" | "ciba_step_up" | "dismiss"
-	Title                string `json:"title"`
-	User                 string `json:"user"`
-	AgentID              string `json:"agent_id"`
-	ParentAgentID        string `json:"parent_agent_id,omitempty"`
-	TaskDescription      string `json:"task_description"`
-	RequestedResource    string `json:"requested_resource"`
-	RequestedActions     []string `json:"requested_actions"`
-	TTLDisplay           string `json:"ttl_display"`
-	RiskScore            float64 `json:"risk_score"`
-	RiskReasons          []string `json:"risk_reasons,omitempty"`
-	ExpiresInSeconds     int    `json:"expires_in_seconds"`
+	PromptID          string   `json:"prompt_id"`
+	Type              string   `json:"type"` // "rar_consent" | "ciba_step_up" | "dismiss"
+	Title             string   `json:"title"`
+	User              string   `json:"user"`
+	AgentID           string   `json:"agent_id"`
+	ParentAgentID     string   `json:"parent_agent_id,omitempty"`
+	TaskDescription   string   `json:"task_description"`
+	RequestedResource string   `json:"requested_resource"`
+	RequestedActions  []string `json:"requested_actions"`
+	TTLDisplay        string   `json:"ttl_display"`
+	RiskScore         float64  `json:"risk_score"`
+	RiskReasons       []string `json:"risk_reasons,omitempty"`
+	ExpiresInSeconds  int      `json:"expires_in_seconds"`
 }
 
 type Hub struct {
@@ -116,7 +116,6 @@ func (h *Hub) ServeSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	ch := make(chan TelemetryEvent, 64)
 	h.mu.Lock()
@@ -145,6 +144,48 @@ func (h *Hub) ServeSSE(w http.ResponseWriter, r *http.Request) {
 			return
 		case ev := <-ch:
 			data, _ := json.Marshal(ev)
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
+}
+
+// ServeSignals is the tenant-safe stream for the console: it carries only "something changed"
+// signals (id, time, kind, status), never event payloads such as tokens, users or agent ids,
+// because one hub serves every tenant. Consoles refetch their own scoped data on each signal.
+func (h *Hub) ServeSignals(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	ch := make(chan TelemetryEvent, 64)
+	h.mu.Lock()
+	h.clients[ch] = struct{}{}
+	h.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		delete(h.clients, ch)
+		h.mu.Unlock()
+	}()
+
+	_, _ = fmt.Fprint(w, ": connected\n\n")
+	flusher.Flush()
+	heartbeat := time.NewTicker(25 * time.Second) // keeps proxies and Cloud Run from closing an idle stream
+	defer heartbeat.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-heartbeat.C:
+			_, _ = fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		case ev := <-ch:
+			data, _ := json.Marshal(map[string]string{"id": ev.ID, "timestamp": ev.Timestamp, "kind": ev.FlowNode, "status": ev.Status})
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		}

@@ -1,0 +1,8 @@
+.git
+*.log
+/mcp-gateway
+/agent-identity-server
+/demo-bank-mcp
+/server
+data/idp_tenant_state.json
+demo-data/bank_state.json

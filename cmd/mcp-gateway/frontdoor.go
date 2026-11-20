@@ -102,7 +102,7 @@ func newGateway(cfg *Config) *Gateway {
 		resource:   cfg.PublicURL + "/mcp",
 		routes:     map[string]*toolRoute{},
 		upErrors:   map[string]string{},
-		authClient: &http.Client{Timeout: 150 * time.Second}, // > CIBA wait (120 s)
+		authClient: &http.Client{Timeout: 150 * time.Second, Transport: gatewayKeyTransport{secret: cfg.SharedSecret}}, // > CIBA wait (120 s)
 		cache:      map[string]cachedToken{},
 		sessions:   map[string]*mcpSession{},
 	}
@@ -173,15 +173,41 @@ func (g *Gateway) close() {
 	}
 }
 
-// registerEgressAllowlist tells the policy engine which hosts this tenant allows.
-func (g *Gateway) registerEgressAllowlist() {
-	body, _ := json.Marshal(map[string]any{"hosts": g.cfg.EgressAllowlist})
-	resp, err := g.authClient.Post(g.cfg.AuthServerInternal+"/api/v1/gateway/egress-allowlist", "application/json", bytes.NewReader(body))
-	if err != nil {
-		log.Printf("WARNING: could not reach authorization server at %s (%v). Start it with: go run ./cmd/server", g.cfg.AuthServerInternal, err)
-		return
+// gatewayKeyTransport authenticates every gateway -> authorization server call with the shared
+// secret (X-Gateway-Key). The server rejects decide/report/introspect calls without it.
+type gatewayKeyTransport struct{ secret string }
+
+func (t gatewayKeyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if t.secret != "" {
+		r = r.Clone(r.Context())
+		r.Header.Set("X-Gateway-Key", t.secret)
 	}
-	resp.Body.Close()
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// registerEgressAllowlist tells the policy engine which hosts this tenant allows. It retries in
+// the background, because on a fresh deploy the authorization server may still be starting.
+func (g *Gateway) registerEgressAllowlist() {
+	go func() {
+		body, _ := json.Marshal(map[string]any{"hosts": g.cfg.EgressAllowlist})
+		for attempt := 1; attempt <= 30; attempt++ {
+			resp, err := g.authClient.Post(g.cfg.AuthServerInternal+"/api/v1/gateway/egress-allowlist", "application/json", bytes.NewReader(body))
+			if err == nil {
+				resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					return
+				}
+				if resp.StatusCode == http.StatusUnauthorized {
+					log.Printf("WARNING: authorization server rejected the gateway key: GATEWAY_SHARED_SECRET must match on both services")
+					return
+				}
+			}
+			if attempt == 1 {
+				log.Printf("WARNING: could not reach authorization server at %s (%v); retrying. Start it with: go run ./cmd/server", g.cfg.AuthServerInternal, err)
+			}
+			time.Sleep(4 * time.Second)
+		}
+	}()
 }
 
 // ---------------------------------------------------------------------------------------------

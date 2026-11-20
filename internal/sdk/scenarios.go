@@ -49,18 +49,18 @@ type IncidentRecord struct {
 }
 
 type BenchmarkSummary struct {
-	TotalIncidents         int              `json:"total_incidents"`
-	OAuthAloneStopped      int              `json:"oauth_alone_stopped"`
-	OAuthAloneReduced      int              `json:"oauth_alone_reduced"`
-	WithGatewayStopped     int              `json:"with_gateway_stopped"`
-	WithGatewayReduced     int              `json:"with_gateway_reduced"`
-	FullStackStopped       int              `json:"full_stack_stopped"`
-	FullStackReduced       int              `json:"full_stack_reduced"`
-	InScopeTotal           int              `json:"in_scope_total"`
-	InScopeStopped         int              `json:"in_scope_stopped"`
-	TotalEvalLatencyUs     int64            `json:"total_eval_latency_us"`
-	AvgIncidentLatencyUs   int64            `json:"avg_incident_latency_us"`
-	EvaluatedIncidents     []IncidentRecord `json:"evaluated_incidents"`
+	TotalIncidents       int              `json:"total_incidents"`
+	OAuthAloneStopped    int              `json:"oauth_alone_stopped"`
+	OAuthAloneReduced    int              `json:"oauth_alone_reduced"`
+	WithGatewayStopped   int              `json:"with_gateway_stopped"`
+	WithGatewayReduced   int              `json:"with_gateway_reduced"`
+	FullStackStopped     int              `json:"full_stack_stopped"`
+	FullStackReduced     int              `json:"full_stack_reduced"`
+	InScopeTotal         int              `json:"in_scope_total"`
+	InScopeStopped       int              `json:"in_scope_stopped"`
+	TotalEvalLatencyUs   int64            `json:"total_eval_latency_us"`
+	AvgIncidentLatencyUs int64            `json:"avg_incident_latency_us"`
+	EvaluatedIncidents   []IncidentRecord `json:"evaluated_incidents"`
 }
 
 type ScenarioOrchestrator struct {

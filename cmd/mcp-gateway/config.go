@@ -14,20 +14,23 @@ type Config struct {
 	AuthServer         string           `json:"auth_server"`          // issuer URL advertised to clients
 	AuthServerInternal string           `json:"auth_server_internal"` // where the gateway calls /decide (defaults to auth_server)
 	EgressAllowlist    []string         `json:"egress_allowlist"`     // hosts agents may reach through URL arguments
+	SharedSecret       string           `json:"-"`                    // GATEWAY_SHARED_SECRET (environment only)
 	Upstreams          []UpstreamConfig `json:"upstreams"`
 }
 
 type UpstreamConfig struct {
-	Name        string            `json:"name"`
-	Description string            `json:"description"`
-	Enabled     *bool             `json:"enabled,omitempty"`
-	Transport   string            `json:"transport"` // "stdio" | "http"
-	Command     string            `json:"command,omitempty"`
-	Args        []string          `json:"args,omitempty"`
-	Env         map[string]string `json:"env,omitempty"`
-	Dir         string            `json:"dir,omitempty"`
-	URL         string            `json:"url,omitempty"`
-	Headers     map[string]string `json:"headers,omitempty"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Enabled     *bool  `json:"enabled,omitempty"`
+	// EnabledIfEnv turns the upstream on only when this environment variable is set (e.g. a token).
+	EnabledIfEnv string            `json:"enabled_if_env,omitempty"`
+	Transport    string            `json:"transport"` // "stdio" | "http"
+	Command      string            `json:"command,omitempty"`
+	Args         []string          `json:"args,omitempty"`
+	Env          map[string]string `json:"env,omitempty"`
+	Dir          string            `json:"dir,omitempty"`
+	URL          string            `json:"url,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty"`
 	// UntrustedOutput marks servers that return internet content (web fetch, email, tickets…).
 	// Their results taint the agent's context, so later risky actions score higher.
 	UntrustedOutput bool                  `json:"untrusted_output,omitempty"`
@@ -43,7 +46,12 @@ type ToolPolicy struct {
 	Hidden    bool     `json:"hidden,omitempty"` // never expose this tool to agents
 }
 
-func (u UpstreamConfig) enabled() bool { return u.Enabled == nil || *u.Enabled }
+func (u UpstreamConfig) enabled() bool {
+	if u.EnabledIfEnv != "" {
+		return os.Getenv(u.EnabledIfEnv) != ""
+	}
+	return u.Enabled == nil || *u.Enabled
+}
 
 func loadConfig(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
@@ -54,6 +62,28 @@ func loadConfig(path string) (*Config, error) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
+	// Environment overrides (Cloud Run and other hosted deployments).
+	if v := os.Getenv("PORT"); v != "" {
+		c.Listen = ":" + v
+	}
+	if v := os.Getenv("PUBLIC_URL"); v != "" {
+		c.PublicURL = v
+	}
+	if v := os.Getenv("AUTH_SERVER_URL"); v != "" {
+		c.AuthServer, c.AuthServerInternal = v, v
+	}
+	if v := os.Getenv("AUTH_SERVER_INTERNAL_URL"); v != "" {
+		c.AuthServerInternal = v
+	}
+	if v := os.Getenv("EGRESS_ALLOWLIST"); v != "" {
+		c.EgressAllowlist = nil
+		for _, h := range strings.Split(v, ",") {
+			if h = strings.TrimSpace(h); h != "" {
+				c.EgressAllowlist = append(c.EgressAllowlist, h)
+			}
+		}
+	}
+	c.SharedSecret = os.Getenv("GATEWAY_SHARED_SECRET")
 	if c.Listen == "" {
 		c.Listen = ":8090"
 	}

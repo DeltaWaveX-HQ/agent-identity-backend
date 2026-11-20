@@ -53,9 +53,9 @@ type ScoreRequest struct {
 	// Telemetry for differentiating Human vs. Agent on the wire:
 	HasAgentToken   bool `json:"has_agent_token"`
 	HasDPoPProof    bool `json:"has_dpop_proof"`
-	InterActionMs   int  `json:"inter_action_ms,omitempty"`   // e.g. 15ms (machine) vs 2400ms (human)
-	LLMPauseBurst   bool `json:"llm_pause_burst,omitempty"`   // 2s LLM inference pause followed by <25ms multi-call burst
-	HeadlessRuntime bool `json:"headless_runtime,omitempty"`  //JA4 / CDP / python-httpx / go-http-client fingerprint
+	InterActionMs   int  `json:"inter_action_ms,omitempty"`  // e.g. 15ms (machine) vs 2400ms (human)
+	LLMPauseBurst   bool `json:"llm_pause_burst,omitempty"`  // 2s LLM inference pause followed by <25ms multi-call burst
+	HeadlessRuntime bool `json:"headless_runtime,omitempty"` //JA4 / CDP / python-httpx / go-http-client fingerprint
 }
 
 type RiskDecision struct {
@@ -75,9 +75,9 @@ type Engine struct {
 	PolicyVersion string
 	// RuleEnabled lets the tenant switch individual hard rules off from the console.
 	// nil means every rule is on.
-	RuleEnabled func(code string) bool
-	hostsMu       sync.RWMutex
-	allowedHosts  map[string]bool
+	RuleEnabled  func(code string) bool
+	hostsMu      sync.RWMutex
+	allowedHosts map[string]bool
 }
 
 func NewEngine() *Engine {

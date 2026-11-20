@@ -166,7 +166,7 @@ func (u *stdioUpstream) startLocked(ctx context.Context) (*stdioProc, error) {
 	u.stopLocked()
 	cmd := exec.Command(u.cfg.Command, u.cfg.Args...)
 	cmd.Dir = u.cfg.Dir
-	cmd.Env = os.Environ()
+	cmd.Env = baseUpstreamEnv()
 	for k, v := range u.cfg.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
@@ -487,3 +487,33 @@ func (u *httpUpstream) Call(ctx context.Context, tool string, args json.RawMessa
 }
 
 func (u *httpUpstream) Close() {}
+
+// baseUpstreamEnv is the environment every stdio upstream gets: what runtimes need to start
+// (PATH, HOME, locale, temp dirs, Node/npm/uv/Go settings), never the gateway's own secrets
+// (GATEWAY_SHARED_SECRET, DATABASE_URL, tokens). An upstream that needs a secret names it in its
+// config "env" block, e.g. {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}.
+func baseUpstreamEnv() []string {
+	keep := []string{"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM",
+		"TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "COMSPEC", "PATHEXT"}
+	prefixes := []string{"NODE_", "NPM_CONFIG_", "npm_config_", "UV_", "XDG_", "GO", "PYTHON"}
+	var env []string
+	for _, kv := range os.Environ() {
+		k, _, _ := strings.Cut(kv, "=")
+		ok := false
+		for _, x := range keep {
+			if strings.EqualFold(k, x) {
+				ok = true
+				break
+			}
+		}
+		for _, p := range prefixes {
+			if !ok && strings.HasPrefix(k, p) {
+				ok = true
+			}
+		}
+		if ok {
+			env = append(env, kv)
+		}
+	}
+	return env
+}

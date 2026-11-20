@@ -9,6 +9,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -21,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/buildathon2026/agent-identity-backend/internal/persist"
 )
 
 type Account struct {
@@ -79,8 +82,22 @@ func seed() State {
 	}
 }
 
+// db is set when BANK_DATABASE_URL is configured: balances and payments then live in Postgres
+// (row kind "bank_state") and survive redeploys. Otherwise they live in a local JSON file.
+var db *persist.Postgres
+
 func load() {
-	raw, err := os.ReadFile(statePath)
+	var raw []byte
+	var err error
+	if db != nil {
+		var found bool
+		raw, found, err = db.Get(context.Background(), "bank_state", "default")
+		if err == nil && !found {
+			err = os.ErrNotExist
+		}
+	} else {
+		raw, err = os.ReadFile(statePath)
+	}
 	if err == nil && json.Unmarshal(raw, &state) == nil && len(state.Accounts) > 0 {
 		return
 	}
@@ -89,8 +106,16 @@ func load() {
 }
 
 func save() {
-	_ = os.MkdirAll(filepath.Dir(statePath), 0o755)
 	raw, _ := json.MarshalIndent(state, "", "  ")
+	if db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := db.Put(ctx, "bank_state", "default", raw); err != nil {
+			fmt.Fprintf(os.Stderr, "demo-bank-mcp: save: %v\n", err)
+		}
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(statePath), 0o755)
 	_ = os.WriteFile(statePath, raw, 0o644)
 }
 
@@ -316,6 +341,17 @@ func reply(out *json.Encoder, id json.RawMessage, result any, err any) {
 func main() {
 	flag.StringVar(&statePath, "state", "demo-data/bank_state.json", "where balances and payments are stored")
 	flag.Parse()
+	if url := os.Getenv("BANK_DATABASE_URL"); url != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		pg, err := persist.OpenPostgres(ctx, url)
+		cancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "demo-bank-mcp: %v\n", err)
+			os.Exit(1)
+		}
+		db = pg
+		statePath = "postgres"
+	}
 	load()
 
 	in := bufio.NewScanner(os.Stdin)

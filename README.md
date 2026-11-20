@@ -69,8 +69,49 @@ The original simulated gateway is still available with `go run ./cmd/mcp-gateway
 
 ### Known prototype limits
 
-- Off-the-shelf clients use plain **bearer** tokens (they cannot do DPoP). DPoP + sub-agent token exchange are shown via `cmd/my-agent` and the sandbox.
-- Signing keys and agent/consent state are in memory. Restarting the server logs every client out; they re-authenticate on the next 401.
-- Dashboard passwords are stored in plain text in `data/idp_tenant_state.json`. Do not use real passwords.
-- `/api/v1/gateway/mcp/*` are internal endpoints with no service-to-service auth. Do not expose port 8080 publicly.
-- ChatGPT and Claude.ai web connectors need a public HTTPS URL (e.g. a tunnel). Set `public_url` in the config and `ISSUER_URL` / `MCP_RESOURCE` on the server to match.
+- Off-the-shelf clients use plain **bearer** tokens (they cannot do DPoP). DPoP + sub-agent token exchange are shown via the Python example and the sandbox.
+- The API and gateway each run as a single instance: state is held in memory and written through to Postgres, then read back at start. Scaling out needs a shared cache first.
+- Policy rules and the egress allowlist are platform-wide (one engine for every organization), so only `ADMIN_EMAILS` may change them.
+- Client-hook sub-agent detection (`/gateway/attribution`) accepts loopback calls only, so it works when the gateway runs on the same machine as the client. Hosted gateways detect sub-agents through token exchange, MCP `_meta`, or `/mcp/sub/<name>`.
+
+## Configuration
+
+| Variable | Service | Purpose |
+|---|---|---|
+| `DATABASE_URL` | server, gateway (bank) | Postgres. Unset = in-memory (local development) |
+| `APP_SECRET` | server | Encrypts the token-signing keys stored in the database |
+| `GATEWAY_SHARED_SECRET` | server, gateway | Gateway → server authentication (`X-Gateway-Key`) for decide / report / introspect |
+| `CONSOLE_ORIGINS` | server | Browser origins allowed to call the console API (CORS) |
+| `ADMIN_EMAILS` | server | Users allowed to change platform-wide settings |
+| `ISSUER_URL`, `MCP_RESOURCE`, `GATEWAY_URL` | server | Public URLs advertised in OAuth discovery metadata |
+| `PUBLIC_URL`, `AUTH_SERVER_URL` | gateway | Public gateway URL; authorization server URL |
+| `GITHUB_TOKEN` | gateway | Turns on GitHub's official MCP server as an upstream |
+
+Unset secrets fall back to open local-development behaviour, with a warning in the log.
+
+## Security model
+
+- **Console API:** every `/api/v1/*` call needs a signed-in session (`Authorization: Bearer sess_…`, 7 days). Passwords are bcrypt-hashed.
+- **Tenant isolation:** a session only sees and acts on its own organization's agents, grants, approvals and audit entries. "Revoke agent" for an agent other organizations also use (e.g. Claude Code's shared client id) revokes only your organization's access.
+- **Gateway endpoints:** decide, report and introspect accept only the gateway's shared key.
+- **CORS:** the console API answers only `CONSOLE_ORIGINS`. OAuth discovery, token and registration stay open to browser-based MCP clients.
+- **Upstream MCP servers:** each gets a minimal environment, never the gateway's secrets. Pass a secret explicitly through the upstream's `env` block.
+- **Live event stream:** carries only "something changed" signals, never payloads.
+
+## Deploy to Google Cloud
+
+```bash
+gcloud auth login
+PROJECT_ID=<your-project> ADMIN_EMAILS=you@example.com ./deploy/gcp.sh
+```
+
+The script is safe to re-run. It creates or updates:
+- **Cloud SQL** for PostgreSQL 17;
+- **Secret Manager** secrets;
+- an **Artifact Registry** repository;
+- three **Cloud Run** services in `asia-south1`:
+  - `agentid-api` (this server),
+  - `agentid-gateway` (MCP gateway with the bank, filesystem and fetch upstreams),
+  - `agentid-console` (the Next.js console from `../agent-identity-ui`).
+
+Images are built with Cloud Build, so no local Docker is needed. At the end it prints the console URL and the `claude mcp add` command for the hosted gateway.

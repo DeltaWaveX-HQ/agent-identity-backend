@@ -10,18 +10,18 @@ import (
 )
 
 type ExecuteRequest struct {
-	AccessToken         string   `json:"access_token"`
-	DPoPProof           string   `json:"dpop_proof"`
-	HTTPMethod          string   `json:"http_method"`
-	TargetURI           string   `json:"target_uri"`
-	TargetHost          string   `json:"target_host"`
-	ResourcePath        string   `json:"resource_path"`
-	Action              string   `json:"action"`
-	UntrustedContext    bool     `json:"untrusted_context"`
-	DeniedThenRetried   bool     `json:"denied_then_retried"`
-	AmountINR           int      `json:"amount_inr,omitempty"`
-	MonitoringTampering bool     `json:"monitoring_tampering"`
-	UnissuedCredential  bool     `json:"unissued_credential"`
+	AccessToken         string `json:"access_token"`
+	DPoPProof           string `json:"dpop_proof"`
+	HTTPMethod          string `json:"http_method"`
+	TargetURI           string `json:"target_uri"`
+	TargetHost          string `json:"target_host"`
+	ResourcePath        string `json:"resource_path"`
+	Action              string `json:"action"`
+	UntrustedContext    bool   `json:"untrusted_context"`
+	DeniedThenRetried   bool   `json:"denied_then_retried"`
+	AmountINR           int    `json:"amount_inr,omitempty"`
+	MonitoringTampering bool   `json:"monitoring_tampering"`
+	UnissuedCredential  bool   `json:"unissued_credential"`
 }
 
 type ExecuteResponse struct {

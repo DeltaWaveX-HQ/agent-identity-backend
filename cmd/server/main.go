@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -9,8 +10,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/buildathon2026/agent-identity-backend/internal/auth"
@@ -38,6 +41,11 @@ func main() {
 	orchestrator := sdk.NewScenarioOrchestrator(authServer, dag, riskEngine, enfGateway, sseHub, dataDir)
 	behavior := risk.NewBehaviorTracker()
 	riskEngine.RuleEnabled = dataStore.IsRuleEnabled // console toggles really change enforcement
+
+	rootCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	syncer, pg := setupPersistence(rootCtx, km, dag, authServer, riskEngine, dataStore)
+	sec := newSecurity(dataStore, syncer)
 
 	// Public issuer URL: what clients see in discovery metadata. Override with ISSUER_URL behind a proxy/tunnel.
 	issuer := os.Getenv("ISSUER_URL")
@@ -108,10 +116,21 @@ func main() {
 	})
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		dbStatus := "not_configured"
+		if pg != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			if err := pg.Ping(ctx); err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "unhealthy", "database": "unreachable"})
+				return
+			}
+			dbStatus = "ok"
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"service":   "agent-identity-backend",
 			"language":  "Go",
 			"status":    "healthy",
+			"database":  dbStatus,
 			"standards": []string{"OAuth 2.1", "RFC 8693 Token Exchange", "RFC 9396 RAR", "RFC 9449 DPoP", "RFC 8707", "RFC 7662 Introspection", "OpenID CIBA", "SPIFFE"},
 		})
 	})
@@ -347,23 +366,23 @@ func main() {
 			})
 
 			sseHub.Publish(events.TelemetryEvent{
-				StepNumber:  2,
-				FromLane:    "as",
-				ToLane:      "agent",
-				Label:       "Issued DPoP Token (" + claims.ClientID + ")",
-				Who:         "Auth Server → " + claims.ClientID,
-				Headline:    "Issued 5-Min ES256 DPoP-Bound Access Token to Your Agent",
-				PlainText:   fmt.Sprintf("Minted token %s for agent '%s' after your consent approval.", claims.JTI, claims.ClientID),
+				StepNumber:   2,
+				FromLane:     "as",
+				ToLane:       "agent",
+				Label:        "Issued DPoP Token (" + claims.ClientID + ")",
+				Who:          "Auth Server → " + claims.ClientID,
+				Headline:     "Issued 5-Min ES256 DPoP-Bound Access Token to Your Agent",
+				PlainText:    fmt.Sprintf("Minted token %s for agent '%s' after your consent approval.", claims.JTI, claims.ClientID),
 				UnderTheHood: fmt.Sprintf("POST /oauth/token (grant_type=authorization_code) · Family=%s · cnf.jkt=%s", claims.FamilyID, jkt),
-				FlowNode:    "token",
-				Status:      "ok",
-				StatusText:  "Token Minted",
-				LatencyUs:   210,
-				TokenRaw:    jwtStr,
-				TokenClaims: claims,
-				DPoPRaw:     dpopProof,
-				DPoPClaims:  dpopClaims,
-				FamilyGraph: dag.GetSnapshot(claims.FamilyID),
+				FlowNode:     "token",
+				Status:       "ok",
+				StatusText:   "Token Minted",
+				LatencyUs:    210,
+				TokenRaw:     jwtStr,
+				TokenClaims:  claims,
+				DPoPRaw:      dpopProof,
+				DPoPClaims:   dpopClaims,
+				FamilyGraph:  dag.GetSnapshot(claims.FamilyID),
 			})
 
 			tokType := "Bearer"
@@ -465,7 +484,7 @@ func main() {
 					FromLane: "agent", ToLane: "as", FlowNode: "refresh", Label: "Token rotated (" + claims.ClientID + ")",
 					Who: claims.ClientID + " → Auth server", Headline: "Refresh token used once and rotated",
 					PlainText: fmt.Sprintf("New 5-minute token %s issued in family %s; the old refresh token is now dead.", claims.JTI, claims.FamilyID),
-					Status: "ok", StatusText: "Rotated", TokenClaims: claims,
+					Status:    "ok", StatusText: "Rotated", TokenClaims: claims,
 				})
 				tokType := "Bearer"
 				if claims.CNF != nil && claims.CNF["jkt"] != "" {
@@ -774,16 +793,16 @@ func main() {
 		})
 
 		writeJSON(w, http.StatusOK, map[string]any{
-			"client_id":          registered.AgentID,
+			"client_id": registered.AgentID,
 			"metadata_document": map[string]any{
-				"client_id":                  req.MetadataURL,
-				"client_name":                registered.Name,
-				"client_uri":                 "https://crm-agent.acme.in",
-				"jwks_uri":                   "https://crm-agent.acme.in/.well-known/jwks.json",
-				"grant_types":                []string{"authorization_code", "urn:ietf:params:oauth:grant-type:token-exchange"},
-				"dpop_bound_access_tokens":   true,
-				"scope":                      "crm.read crm.leads.sync invoices.read",
-				"crm_connector":              req.CRMTarget,
+				"client_id":                req.MetadataURL,
+				"client_name":              registered.Name,
+				"client_uri":               "https://crm-agent.acme.in",
+				"jwks_uri":                 "https://crm-agent.acme.in/.well-known/jwks.json",
+				"grant_types":              []string{"authorization_code", "urn:ietf:params:oauth:grant-type:token-exchange"},
+				"dpop_bound_access_tokens": true,
+				"scope":                    "crm.read crm.leads.sync invoices.read",
+				"crm_connector":            req.CRMTarget,
 			},
 			"dpop_cnf_jkt":      registered.DPoPThumbprint,
 			"status":            "VERIFIED_AND_REGISTERED",
@@ -794,10 +813,10 @@ func main() {
 	// POST /oauth/dpop-sign — Utility endpoint so the UI Sandbox can generate a real ES256 DPoP proof for a custom Gateway test call
 	mux.HandleFunc("/oauth/dpop-sign", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			AccessToken  string `json:"access_token"`
-			HTTPMethod   string `json:"http_method"`
-			TargetURI    string `json:"target_uri"`
-			SimulateTheft bool  `json:"simulate_theft"`
+			AccessToken   string `json:"access_token"`
+			HTTPMethod    string `json:"http_method"`
+			TargetURI     string `json:"target_uri"`
+			SimulateTheft bool   `json:"simulate_theft"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		kp, _ := crypto.GenerateAgentDPoPKeypair("sandbox-key")
@@ -830,11 +849,6 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		// Reset runtime agents/logs so the new organization starts 100% clean with 0 pre-filled data
-		authServer.Reset()
-		sseHub.ClearHistory()
-		dataStore.ClearOrgActivity(org.ID)
-
 		writeJSON(w, http.StatusCreated, map[string]any{
 			"user":          user,
 			"organization":  org,
@@ -860,6 +874,17 @@ func main() {
 		})
 	})
 
+	mux.HandleFunc("/api/v1/auth/logout", func(w http.ResponseWriter, r *http.Request) {
+		dataStore.Logout(sessionToken(r))
+		writeJSON(w, http.StatusOK, map[string]string{"status": "signed_out"})
+	})
+
+	// GET /api/v1/auth/me — validates a saved console session.
+	mux.HandleFunc("/api/v1/auth/me", func(w http.ResponseWriter, r *http.Request) {
+		u, org, _ := dataStore.GetSession(sessionToken(r))
+		writeJSON(w, http.StatusOK, map[string]any{"user": u, "organization": org})
+	})
+
 	mux.HandleFunc("/api/v1/orgs", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			var body struct {
@@ -869,9 +894,6 @@ func main() {
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			org := dataStore.CreateOrganization(body.OwnerEmail, body.OrgName, body.OrgDomain)
-			authServer.Reset()
-			sseHub.ClearHistory()
-			dataStore.ClearOrgActivity(org.ID)
 			writeJSON(w, http.StatusCreated, org)
 			return
 		}
@@ -1327,7 +1349,7 @@ func main() {
 	// =========================================================================
 	// 6. EMERGENCY KILL SWITCH, SSE STREAM, SCENARIOS & 25-INCIDENT BENCHMARK
 	// =========================================================================
-	mux.HandleFunc("/api/v1/events/stream", sseHub.ServeSSE)
+	mux.HandleFunc("/api/v1/events/stream", sseHub.ServeSignals) // tenant-safe: change signals only
 	mux.HandleFunc("/api/v1/events/history", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"events":        sseHub.GetHistory(),
@@ -1434,9 +1456,24 @@ func main() {
 		port = "8080"
 	}
 	log.Printf("🛡️  Agent Identity IAM Platform & OAuth 2.1 + DPoP Authorization Server listening on http://localhost:%s", port)
-	if err := http.ListenAndServe(":"+port, corsMiddleware(mux)); err != nil {
+	srv := &http.Server{Addr: ":" + port, Handler: sec.middleware(deps.tenancyMiddleware(mux)), ReadHeaderTimeout: 10 * time.Second}
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-rootCtx.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		if syncer != nil {
+			if err := syncer.Flush(ctx); err != nil {
+				log.Printf("persist: shutdown flush: %v", err)
+			}
+		}
+	}()
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+	<-shutdownDone // final database flush
 }
 
 func resolveDataDir() string {
@@ -1452,19 +1489,6 @@ func resolveDataDir() string {
 		}
 	}
 	return "data"
-}
-
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, DPoP")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

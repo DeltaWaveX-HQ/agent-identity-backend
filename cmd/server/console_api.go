@@ -68,9 +68,12 @@ func registerConsoleAPI(mux *http.ServeMux, d *serverDeps) {
 	mux.HandleFunc("/api/v1/console/connections", d.consoleConnections)
 }
 
-func (d *serverDeps) grantViews() []grantView {
+func (d *serverDeps) grantViews(t *tenant) []grantView {
 	var out []grantView
 	for _, c := range d.authServer.ListConsents() {
+		if !t.owns(c.UserSub) {
+			continue // other organizations' grants (and consents nobody has approved yet)
+		}
 		if c.RedirectURI == "" && c.SubAgentName == "" && !c.Approved {
 			continue // internal sandbox prompts that never reached a human
 		}
@@ -98,6 +101,9 @@ func (d *serverDeps) grantViews() []grantView {
 	}
 	// Sub-agents the client spawned on its own (detected by the gateway) and the access delegated to them.
 	for _, dl := range d.authServer.ListDelegations() {
+		if !t.owns(dl.UserSub) {
+			continue
+		}
 		g := grantView{
 			ConsentID: dl.ID, AgentID: dl.SubAgentID, AgentName: dl.SubAgentType, UserSub: dl.UserSub,
 			Status: d.authServer.DelegationStatus(dl), Actions: dl.Actions, Resource: "delegated by " + dl.ParentAgentID,
@@ -126,10 +132,23 @@ func within24h(ts string) bool {
 	return err == nil && time.Since(t) < 24*time.Hour
 }
 
-func (d *serverDeps) agentViews() []agentView {
-	grants := d.grantViews()
-	logs := d.dataStore.ListAuditLogs() // newest first
-	agents := d.authServer.ListAgents()
+func (d *serverDeps) agentViews(t *tenant) []agentView {
+	grants := d.grantViews(t)
+	logs := d.tenantLogs(t) // newest first
+	// An agent appears in a tenant's directory when one of the tenant's users owns it or gave it access.
+	related := map[string]bool{}
+	for _, g := range grants {
+		related[g.AgentID] = true
+		if g.ParentAgentID != "" {
+			related[g.ParentAgentID] = true
+		}
+	}
+	var agents []*auth.RegisteredAgent
+	for _, a := range d.authServer.ListAgents() {
+		if t == nil || related[a.AgentID] || (a.OwnerUser != "pending-consent" && t.owns(a.OwnerUser)) {
+			agents = append(agents, a)
+		}
+	}
 
 	children := map[string][]string{}
 	for _, a := range agents {
@@ -163,14 +182,23 @@ func (d *serverDeps) agentViews() []agentView {
 		if a.ParentAgentID != "" {
 			v.Kind = "sub-agent"
 		}
+		mine, allRevoked := 0, true
 		for i := range grants {
-			if grants[i].AgentID == a.AgentID && grants[i].Status == "active" {
+			if grants[i].AgentID != a.AgentID {
+				continue
+			}
+			mine++
+			if grants[i].Status != "revoked" {
+				allRevoked = false
+			}
+			if grants[i].Status == "active" && v.ActiveGrant == nil {
 				g := grants[i]
 				v.ActiveGrant, v.Status = &g, "active"
-				break
 			}
 		}
-		if a.Status == "REVOKED" {
+		// Revoked globally, or (for an agent shared with other organizations) every grant this
+		// organization gave it has been revoked.
+		if a.Status == "REVOKED" || (mine > 0 && allRevoked) {
 			v.Status = "revoked"
 		}
 		for _, e := range logs {
@@ -193,11 +221,26 @@ func (d *serverDeps) agentViews() []agentView {
 	return out
 }
 
-func (d *serverDeps) pendingApprovals() []*auth.CIBARequest {
+// tenantLogs returns the audit log entries this tenant may see (all for the gateway).
+func (d *serverDeps) tenantLogs(t *tenant) []*store.AuditLogEntry {
+	all := d.dataStore.ListAuditLogs()
+	if t == nil {
+		return all
+	}
+	out := make([]*store.AuditLogEntry, 0, len(all))
+	for _, e := range all {
+		if t.ownsAudit(e) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func (d *serverDeps) pendingApprovals(t *tenant) []*auth.CIBARequest {
 	now := time.Now().Unix()
 	var out []*auth.CIBARequest
 	for _, c := range d.authServer.ListCIBARequests() {
-		if c.Status == "PENDING" && c.ExpiresAt > now {
+		if c.Status == "PENDING" && c.ExpiresAt > now && t.owns(c.UserSub) {
 			out = append(out, c)
 		}
 	}
@@ -206,7 +249,8 @@ func (d *serverDeps) pendingApprovals() []*auth.CIBARequest {
 }
 
 func (d *serverDeps) consoleOverview(w http.ResponseWriter, r *http.Request) {
-	agents := d.agentViews()
+	t := d.tenantFor(r)
+	agents := d.agentViews(t)
 	var active, subs, revoked int
 	for _, a := range agents {
 		if a.Kind == "sub-agent" {
@@ -220,12 +264,12 @@ func (d *serverDeps) consoleOverview(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	activeGrants := 0
-	for _, g := range d.grantViews() {
+	for _, g := range d.grantViews(t) {
 		if g.Status == "active" {
 			activeGrants++
 		}
 	}
-	logs := d.dataStore.ListAuditLogs()
+	logs := d.tenantLogs(t)
 	counts := map[string]int{"allowed": 0, "approved": 0, "stepped_up": 0, "blocked": 0}
 	reasons := map[string]int{}
 	var recent []*store.AuditLogEntry
@@ -255,7 +299,7 @@ func (d *serverDeps) consoleOverview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"agents":            map[string]int{"total": len(agents), "active": active, "sub_agents": subs, "revoked": revoked},
 		"active_grants":     activeGrants,
-		"pending_approvals": d.pendingApprovals(),
+		"pending_approvals": d.pendingApprovals(t),
 		"calls_24h":         counts,
 		"top_block_reasons": reasons,
 		"recent_activity":   recent,
@@ -263,13 +307,15 @@ func (d *serverDeps) consoleOverview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *serverDeps) consoleAgents(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, d.agentViews())
+	writeJSON(w, http.StatusOK, d.agentViews(d.tenantFor(r)))
 }
 
 func (d *serverDeps) consoleAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
+	t := d.tenantFor(r)
+	views := d.agentViews(t)
 	var view *agentView
-	for _, a := range d.agentViews() {
+	for _, a := range views {
 		if a.AgentID == id {
 			a := a
 			view = &a
@@ -282,7 +328,7 @@ func (d *serverDeps) consoleAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	var grants []grantView
 	families := map[string]bool{}
-	for _, g := range d.grantViews() {
+	for _, g := range d.grantViews(t) {
 		if g.AgentID == id {
 			grants = append(grants, g)
 			if g.FamilyID != "" {
@@ -295,13 +341,13 @@ func (d *serverDeps) consoleAgent(w http.ResponseWriter, r *http.Request) {
 		tokens = append(tokens, d.dag.GetSnapshot(f))
 	}
 	var activity []*store.AuditLogEntry
-	for _, e := range d.dataStore.ListAuditLogs() {
+	for _, e := range d.tenantLogs(t) {
 		if e.AgentID == id && len(activity) < 100 {
 			activity = append(activity, e)
 		}
 	}
 	var subAgents []agentView
-	for _, a := range d.agentViews() {
+	for _, a := range views {
 		if a.ParentAgentID == id {
 			subAgents = append(subAgents, a)
 		}
@@ -318,11 +364,11 @@ func (d *serverDeps) consoleAgent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *serverDeps) consoleGrants(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, d.grantViews())
+	writeJSON(w, http.StatusOK, d.grantViews(d.tenantFor(r)))
 }
 
 func (d *serverDeps) consoleApprovals(w http.ResponseWriter, r *http.Request) {
-	out := d.pendingApprovals()
+	out := d.pendingApprovals(d.tenantFor(r))
 	if out == nil {
 		out = []*auth.CIBARequest{}
 	}
